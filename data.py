@@ -29,7 +29,12 @@ def _latest(pattern: str) -> Path:
     return matches[0]
 
 
-SURVEY_CSV = _latest("Customer Behaviour Survey Replies*.csv")
+def _all_matching(pattern: str) -> list[Path]:
+    """All matching files, oldest → newest by mtime."""
+    return sorted(PROJECT_DIR.glob(pattern), key=lambda p: p.stat().st_mtime)
+
+
+SURVEY_CSVS = _all_matching("Customer Behaviour Survey Replies*.csv")
 SKU_CSV = _latest("Final Price Change Proposal*.csv")
 OVERRIDES_CSV = PROJECT_DIR / "unmatched_numeric_bills.csv"
 
@@ -190,12 +195,29 @@ def _normalize_alpha_serial(raw: str) -> str | None:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_survey() -> pd.DataFrame:
-    """Load the survey CSV, filter to >= go-live, normalize stores, derive
-    serial_norm + bill_kind.
-    """
-    raw = pd.read_csv(SURVEY_CSV, header=0, dtype=str).fillna("")
-    # Position-index columns since headers are long Hinglish phrases.
-    cols = raw.columns.tolist()
+    """Concat ALL survey CSVs (incremental exports), dedup by Submission ID
+    keeping the newest file's version, then filter to >= go-live, normalize
+    stores, derive serial_norm + bill_kind."""
+    if not SURVEY_CSVS:
+        raise FileNotFoundError("No 'Customer Behaviour Survey Replies*.csv' files found")
+    frames = []
+    expected_cols = None
+    for path in SURVEY_CSVS:
+        r = pd.read_csv(path, header=0, dtype=str).fillna("")
+        if expected_cols is None:
+            expected_cols = len(r.columns)
+        elif len(r.columns) != expected_cols:
+            raise ValueError(
+                f"Column count mismatch in {path.name}: got {len(r.columns)}, expected {expected_cols}"
+            )
+        # Rename to positional names so concat aligns even if headers differ slightly.
+        r.columns = [f"c{i}" for i in range(len(r.columns))]
+        frames.append(r)
+    raw = pd.concat(frames, ignore_index=True)
+    # Dedup by Submission ID (column 0). Files were read oldest → newest, so
+    # `keep="last"` keeps the newest version in case of corrections.
+    raw = raw.drop_duplicates(subset=["c0"], keep="last").reset_index(drop=True)
+    cols = list(raw.columns)
     df = pd.DataFrame({
         "submission_id": raw[cols[COL_SUBMISSION_ID]],
         "submitted_at": pd.to_datetime(raw[cols[COL_SUBMITTED_AT]], errors="coerce"),
