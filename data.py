@@ -33,10 +33,12 @@ SURVEY_CSV = _latest("Customer Behaviour Survey Replies*.csv")
 SKU_CSV = _latest("Final Price Change Proposal*.csv")
 OVERRIDES_CSV = PROJECT_DIR / "unmatched_numeric_bills.csv"
 
-# Local Parquet snapshot of the Redshift sales slice — used for offline runs
-# (Streamlit Cloud has no VPN access). Refresh via `python refresh_snapshots.py`.
+# Local Parquet snapshots — used for offline runs (Streamlit Cloud has no VPN
+# access). Refresh via `python refresh_snapshots.py`.
 SNAPSHOTS_DIR = PROJECT_DIR / "data_snapshots"
-SALES_SNAPSHOT = SNAPSHOTS_DIR / "sales.parquet"
+SALES_SNAPSHOT = SNAPSHOTS_DIR / "sales.parquet"           # line-level, 14 stores
+STORE_TOTALS_SNAPSHOT = SNAPSHOTS_DIR / "store_totals.parquet"   # per-store-per-day-per-bill-set KPI totals, ALL chain stores
+PATIENTS_SNAPSHOT = SNAPSHOTS_DIR / "patients_first_seen.parquet"  # patient_id -> first_seen_date
 
 # Known surveyor-typo prefixes — applied after Z-strip + uppercase in serial normalization.
 PREFIX_FIXES = {"KEWT": "KRWT"}
@@ -44,16 +46,20 @@ PREFIX_FIXES = {"KEWT": "KRWT"}
 GO_LIVE_DATE = pd.Timestamp("2026-05-06")
 COUPON_PREFIX = "GENRTN"
 
-# ----- Quant Insight: store-pair A/B test --------------------------------------
-# Test = Set A (price increase applied), Control = Set B (unchanged).
+# ----- Quant Insight: pilot/non-pilot A/B test ---------------------------------
+# Pilot = stores where the price increase was applied. Non-pilot = paired control.
+# (Earlier iterations used "test"/"control" labels; 3 pairs were re-labelled when
+# the user clarified which side was actually piloted.)
 STORE_PAIRS = [
-    {"pair": 1, "city": "Mumbai", "test": "Colaba",                      "control": "Pantnagar"},
-    {"pair": 2, "city": "Mumbai", "test": "Virar West",                  "control": "Khanda Colony"},
-    {"pair": 3, "city": "Mumbai", "test": "Dahisar",                     "control": "Bhiwandi Dhamankar Naka"},
-    {"pair": 4, "city": "Mumbai", "test": "Khar West",                   "control": "Dombivali"},
-    {"pair": 5, "city": "Mumbai", "test": "Mulund West-Sarvodaya Nagar", "control": "Goregaon West S.V. Road"},
-    {"pair": 6, "city": "Mumbai", "test": "Sanpada",                     "control": "Airoli"},
+    {"pair": 1, "city": "Mumbai", "pilot": "Colaba",                      "non_pilot": "Pantnagar"},
+    {"pair": 2, "city": "Mumbai", "pilot": "Khanda Colony",               "non_pilot": "Virar West"},
+    {"pair": 3, "city": "Mumbai", "pilot": "Bhiwandi Dhamankar Naka",     "non_pilot": "Dahisar"},
+    {"pair": 4, "city": "Mumbai", "pilot": "Khar West",                   "non_pilot": "Dombivali"},
+    {"pair": 5, "city": "Mumbai", "pilot": "Goregaon West S.V. Road",     "non_pilot": "Mulund West-Sarvodaya Nagar"},
+    {"pair": 6, "city": "Mumbai", "pilot": "Sanpada",                     "non_pilot": "Airoli"},
 ]
+PILOT_STORES = tuple(p["pilot"] for p in STORE_PAIRS)
+PAIRED_NON_PILOT_STORES = tuple(p["non_pilot"] for p in STORE_PAIRS)
 QUANT_PRE_START = pd.Timestamp("2026-04-24").date()
 QUANT_PRE_END = pd.Timestamp("2026-05-05").date()
 QUANT_POST_START = pd.Timestamp("2026-05-06").date()
@@ -355,6 +361,78 @@ def _load_sales_snapshot() -> pd.DataFrame | None:
     return df
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_store_totals_snapshot() -> pd.DataFrame | None:
+    """Pre-aggregated per-store-per-day-per-bill-set KPI totals for ALL chain
+    stores. Used by the Summary tab to compare pilot vs all-other stores
+    without pulling line-level data for ~195 stores."""
+    if not STORE_TOTALS_SNAPSHOT.exists():
+        return None
+    df = pd.read_parquet(STORE_TOTALS_SNAPSHOT)
+    if "day" in df.columns:
+        df["day"] = pd.to_datetime(df["day"], errors="coerce").dt.date
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_patients_snapshot() -> dict | None:
+    """Load patient_id -> first-ever bill date lookup. Used for new-patient KPI."""
+    if not PATIENTS_SNAPSHOT.exists():
+        return None
+    df = pd.read_parquet(PATIENTS_SNAPSHOT)
+    return dict(zip(df["patient_id"].astype(int), pd.to_datetime(df["first_seen"]).dt.date))
+
+
+def aggregate_totals(
+    totals: pd.DataFrame,
+    stores: tuple[str, ...],
+    date_from,
+    date_to,
+    bill_filter: str = "with_pi",
+) -> dict:
+    """Sum pre-aggregated per-store-per-day totals for the given store set and
+    date window. Returns the same KPI dict shape as `compute_kpis` (for the
+    metrics that can be computed from aggregates — patient-related KPIs and
+    mix ratios are approximated since aggregates don't preserve patient-level
+    detail across stores)."""
+    if totals is None or totals.empty:
+        return {}
+    d_from = pd.Timestamp(date_from).date()
+    d_to = pd.Timestamp(date_to).date()
+    sub = totals[
+        totals["store_name"].isin(stores)
+        & (totals["day"] >= d_from)
+        & (totals["day"] <= d_to)
+        & (totals["bill_filter"] == bill_filter)
+    ]
+    if sub.empty: return {}
+    sum_cols = [
+        "revenue", "cogs", "promo_discount_total", "bill_count", "unique_customers",
+        "generic_units", "ethical_units", "total_units", "generic_revenue",
+        "total_revenue", "promo_bills", "promo_discount_promo",
+        "return_units", "total_quantity", "repeat_patient_count",
+        "new_patient_count",
+    ]
+    out = {c: float(sub[c].sum()) if c in sub.columns else 0.0 for c in sum_cols}
+    out["gm"] = out["revenue"] - out["cogs"] - out["promo_discount_total"]
+    out["gm_pct"] = (out["gm"] / out["revenue"]) if out["revenue"] else 0.0
+    out["aov"] = (out["revenue"] / out["bill_count"]) if out["bill_count"] else 0.0
+    out["aom"] = (out["gm"] / out["bill_count"]) if out["bill_count"] else 0.0
+    out["acm"] = (out["gm"] / out["unique_customers"]) if out["unique_customers"] else 0.0
+    out["frequency"] = (out["bill_count"] / out["unique_customers"]) if out["unique_customers"] else 0.0
+    out["items_per_bill"] = (out["total_quantity"] / out["bill_count"]) if out["bill_count"] else 0.0
+    out["revenue_per_patient"] = (out["revenue"] / out["unique_customers"]) if out["unique_customers"] else 0.0
+    out["generic_mix_units_pct"] = (out["generic_units"] / out["total_units"]) if out["total_units"] else 0.0
+    out["generic_mix_revenue_pct"] = (out["generic_revenue"] / out["total_revenue"]) if out["total_revenue"] else 0.0
+    out["promo_usage_rate"] = (out["promo_bills"] / out["bill_count"]) if out["bill_count"] else 0.0
+    out["promo_share_revenue"] = (out["promo_discount_promo"] / out["total_revenue"]) if out["total_revenue"] else 0.0
+    out["return_rate"] = (out["return_units"] / out["total_units"]) if out["total_units"] else 0.0
+    # Note: unique_customers is summed across stores, so a customer who shopped
+    # at 2 stores is counted twice. That's a known limitation of per-store
+    # pre-aggregation; documented in the dashboard caption.
+    return out
+
+
 @st.cache_data(ttl=1800, show_spinner="Querying Redshift…")
 def fetch_sales(serials: tuple[str, ...]) -> pd.DataFrame:
     """Snapshot-first: filter local Parquet for the given serials.
@@ -604,12 +682,24 @@ def fetch_quant_sales(stores: tuple[str, ...], date_from: str, date_to: str) -> 
     return df
 
 
-def compute_kpis(df: pd.DataFrame, sku_ids: set[int] | None = None) -> dict:
+def compute_kpis(
+    df: pd.DataFrame,
+    sku_ids: set[int] | None = None,
+    patient_first_seen: dict | None = None,
+    bill_filter: str = "with_pi",
+) -> dict:
     """Pure compute: given a sales slice, return a dict of all KPIs.
     Caller filters by store + date window upfront.
-    If sku_ids is provided, restrict to bills that contain ≥1 line whose
-    drug-id is in sku_ids (the price-↑ SKU set). Returns retain all bills
-    that are returns of those filtered bills as well (matched on bill_id).
+
+    `sku_ids` is the price-↑ SKU set. `bill_filter`:
+      - `with_pi`    : keep bills with ≥1 price-↑ SKU line (default)
+      - `without_pi` : keep bills with ZERO price-↑ SKU lines (control bills)
+      - `all`        : no bill-level filter
+    If `sku_ids` is None, bill_filter is ignored.
+
+    `patient_first_seen` is an optional `{patient_id: first_seen_date}` lookup
+    used to compute `new_patient_count` (patients whose first-ever bill in the
+    chain falls inside this slice's date range).
     """
     empty = {k: 0.0 for k in [
         "revenue", "cogs", "promo_discount_total", "gm", "gm_pct",
@@ -618,15 +708,23 @@ def compute_kpis(df: pd.DataFrame, sku_ids: set[int] | None = None) -> dict:
         "generic_mix_units_pct", "generic_revenue", "total_revenue",
         "generic_mix_revenue_pct", "promo_bills", "promo_usage_rate",
         "promo_share_revenue", "return_units", "return_rate",
+        "total_quantity", "repeat_patient_count", "new_patient_count",
+        "items_per_bill", "revenue_per_patient",
     ]}
     if df.empty: return empty
 
-    # Filter to bills containing ≥1 price-↑ SKU line (using gross bills only as the source of truth).
-    if sku_ids is not None:
+    # Bill-level filter using gross bills as the source of truth.
+    if sku_ids is not None and bill_filter != "all":
         gross_all = df[df["bill_flag"] == "gross"]
         pi_bill_ids = set(gross_all.loc[gross_all["drug_id"].isin(sku_ids), "bill_id"].dropna().unique())
-        if not pi_bill_ids: return empty
-        df = df[df["bill_id"].isin(pi_bill_ids)]
+        if bill_filter == "with_pi":
+            if not pi_bill_ids: return empty
+            df = df[df["bill_id"].isin(pi_bill_ids)]
+        elif bill_filter == "without_pi":
+            all_bill_ids = set(gross_all["bill_id"].dropna().unique())
+            non_pi_bill_ids = all_bill_ids - pi_bill_ids
+            if not non_pi_bill_ids: return empty
+            df = df[df["bill_id"].isin(non_pi_bill_ids)]
 
     gross = df[df["bill_flag"] == "gross"]
     ret = df[df["bill_flag"] == "return"]
@@ -663,6 +761,31 @@ def compute_kpis(df: pd.DataFrame, sku_ids: set[int] | None = None) -> dict:
     return_units = float(ret["net_quantity"].abs().sum())  # returns stored as negative qty
     return_rate = (return_units / total_units) if total_units else 0.0
 
+    # New KPIs (Phase 5)
+    total_quantity = total_units  # alias — "total quantity" is just total_units
+    items_per_bill = (total_quantity / bill_count) if bill_count else 0.0
+    revenue_per_patient = (revenue / unique_customers) if unique_customers else 0.0
+
+    # Repeat patient = patient with ≥2 distinct bills inside this slice.
+    bills_per_patient = (
+        gross.dropna(subset=["patient_id"])
+        .groupby("patient_id")["bill_id"].nunique()
+    )
+    repeat_patient_count = int((bills_per_patient >= 2).sum())
+
+    # New patient = patient whose first-ever bill (per the patients lookup) falls
+    # within this slice's [min, max] date range.
+    new_patient_count = 0
+    if patient_first_seen is not None and not gross.empty:
+        date_min = gross["created_at"].dt.date.min()
+        date_max = gross["created_at"].dt.date.max()
+        patient_ids = gross["patient_id"].dropna().unique().tolist()
+        new_patient_count = sum(
+            1 for pid in patient_ids
+            if (fs := patient_first_seen.get(int(pid))) is not None
+            and date_min <= fs <= date_max
+        )
+
     return {
         "revenue": revenue, "cogs": cogs, "promo_discount_total": promo_discount_total,
         "gm": gm, "gm_pct": gm_pct,
@@ -675,21 +798,30 @@ def compute_kpis(df: pd.DataFrame, sku_ids: set[int] | None = None) -> dict:
         "promo_bills": promo_bills, "promo_usage_rate": promo_usage_rate,
         "promo_share_revenue": promo_share_revenue,
         "return_units": return_units, "return_rate": return_rate,
+        "total_quantity": total_quantity,
+        "repeat_patient_count": repeat_patient_count,
+        "new_patient_count": new_patient_count,
+        "items_per_bill": items_per_bill,
+        "revenue_per_patient": revenue_per_patient,
     }
 
 
 def build_pair_table(test_pre: pd.DataFrame, test_post: pd.DataFrame,
                      ctrl_pre: pd.DataFrame, ctrl_post: pd.DataFrame,
-                     sku_ids: set[int] | None = None) -> pd.DataFrame:
+                     sku_ids: set[int] | None = None,
+                     patient_first_seen: dict | None = None,
+                     bill_filter: str = "with_pi") -> pd.DataFrame:
     """Produce a long-form DataFrame with columns:
        kpi · test_pre · test_post · test_delta_pct · ctrl_pre · ctrl_post · ctrl_delta_pct · did
-    If sku_ids is provided, every cell is scoped to bills containing ≥1 price-↑ SKU.
+    `test_pre` corresponds to pilot pre-window, `ctrl_pre` to non-pilot pre.
+    (The legacy `test`/`ctrl` parameter names are kept for backwards compat;
+    callers should pass pilot/non-pilot data.)
     """
     cells = {
-        "test_pre": compute_kpis(test_pre, sku_ids),
-        "test_post": compute_kpis(test_post, sku_ids),
-        "ctrl_pre": compute_kpis(ctrl_pre, sku_ids),
-        "ctrl_post": compute_kpis(ctrl_post, sku_ids),
+        "test_pre": compute_kpis(test_pre, sku_ids, patient_first_seen, bill_filter),
+        "test_post": compute_kpis(test_post, sku_ids, patient_first_seen, bill_filter),
+        "ctrl_pre": compute_kpis(ctrl_pre, sku_ids, patient_first_seen, bill_filter),
+        "ctrl_post": compute_kpis(ctrl_post, sku_ids, patient_first_seen, bill_filter),
     }
     rows = []
     keys = list(cells["test_pre"].keys())

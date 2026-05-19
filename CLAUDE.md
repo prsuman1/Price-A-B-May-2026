@@ -141,13 +141,82 @@ Price-match coupon. Detected via `UPPER(TRIM(promo-code)) LIKE 'GENRTN%'` on the
 
 ## Quant Insight page
 
-Currently a placeholder (`quant_insight.py`). User will brief the requirements next. Likely areas:
-- Revenue impact (actual vs counterfactual at old prices).
-- Basket-level price effects.
-- Per-SKU elasticity (units sold pre vs post go-live).
-- Margin / GMV deltas.
+(File: `quant_insight.py`. Sidebar: pre/post date inputs.)
 
-When building, **import `build_joined()` from `data.py`** so the data layer stays single-sourced. The shared dict already has `survey`, `skus`, `sales`, `bills`, `missing_serials`, `stats`. The `sales` DataFrame has `quantity`, `rate`, `revenue_value`, `mrp`, `is_price_increased` per line — sufficient for most quantitative work without re-querying Redshift.
+A/B test of the 2026-05-06 price increase using **6 Mumbai store pairs**. **Pilot** = stores where the price went up. **Non-Pilot** = paired control. **DiD** = Pilot Δ% − Non-Pilot Δ%.
+
+### Pair definitions (in `data.py::STORE_PAIRS`)
+
+| # | Pilot (price ↑) | Non-Pilot (paired control) |
+|---:|---|---|
+| 1 | Colaba | Pantnagar |
+| 2 | Khanda Colony | Virar West |
+| 3 | Bhiwandi Dhamankar Naka | Dahisar |
+| 4 | Khar West | Dombivali |
+| 5 | Goregaon West S.V. Road | Mulund West-Sarvodaya Nagar |
+| 6 | Sanpada | Airoli |
+
+Helper constants: `PILOT_STORES`, `PAIRED_NON_PILOT_STORES`.
+
+### Methodology
+
+- **Symmetric pre/post windows.** Currently 12 days: Pre `2026-04-24 → 2026-05-05`, Post `2026-05-06 → 2026-05-17`. Constants in `data.py`.
+- **Three comparators:** Pilot vs **Paired Non-Pilot** (6 stores) vs **All-Other** (~195 chain stores not in the experiment, from per-store-per-day aggregates).
+- **Bill-set toggle.** Page-level radio: `Price-↑ bills` (default — bills with ≥1 price-↑ SKU) / `Non-price-↑ bills` (bills with ZERO price-↑ SKU lines) / `All bills`. Implemented as `bill_filter` kwarg through `compute_kpis`, `build_pair_table`, `compute_repeat_churn`.
+- **DiD coloured by direction.** `KPI_DIRECTION` map in `quant_insight.py`. Positive-when-↑-is-good colours green; negative colours red.
+
+### KPI catalogue (in `data.py::compute_kpis`)
+
+Grouped for the dashboard:
+
+**Volume** — `bill_count`, `unique_customers` (patients), `total_quantity`, `repeat_patient_count` (≥2 bills in window), `new_patient_count` (first-ever bill in chain falls in window — uses `patients_first_seen.parquet`).
+
+**Revenue & Margin** — `revenue` (`Σ(revenue_value − promo_discount)`), `gm` (`revenue − cogs − promo_discount`; COGS = `Σ(net_qty × purchase_rate)`), `gm_pct`.
+
+**Per bill / per patient** — `aov` (revenue/bill), `aom` (gm/bill), `acm` (gm/patient), `items_per_bill`, `revenue_per_patient`, `frequency` (bills/patient).
+
+**Mix** — `generic_mix_units_pct`, `generic_mix_revenue_pct` (assortment IDs 3,4 = Generic; 1,2 = Ethical).
+
+**Promo / Returns** — `promo_usage_rate` (GENRTN bills/total bills), `promo_share_revenue`, `return_rate`.
+
+**Guardrails (pair view only)** — `repeat_rate` (customers in pre AND post), `churn_rate` (in pre, not in post). Computed by `compute_repeat_churn`.
+
+**Elasticity** — `compute_elasticity` per drug_id; own-price + cross-price (Gen→Eth) at chain level.
+
+### Page structure
+
+4 tabs:
+1. **🏪 Summary** — Hero metrics + per-group table: Pilot Pre/Post/Δ% vs Non-Pilot Δ% vs All-Other Δ%, with two DiD columns (vs Paired, vs All-Other). KPIs rendered by group.
+2. **🔀 Store vs Store** — Per-pair pilot ↔ non-pilot for the same KPI groups.
+3. **📈 Elasticity** — Top-20 most price-sensitive SKUs + chain-level cross-price elasticity (Gen→Eth).
+4. **🔍 Drill-down** — Pair × side × window selector → bill-level table + CSV.
+
+### Data layer (`data.py`)
+
+- `_load_sales_snapshot()` — `data_snapshots/sales.parquet` (line-level, 14 pair-related stores).
+- `_load_store_totals_snapshot()` — `data_snapshots/store_totals.parquet` (per-store-per-day-per-bill-set aggregates, all 201 stores).
+- `_load_patients_snapshot()` — `data_snapshots/patients_first_seen.parquet` (patient_id → first-ever bill date).
+- `aggregate_totals(...)` — sums the per-store-per-day totals for a store set + window; returns the same dict shape as `compute_kpis`. Used for the All-Other comparator.
+
+### Caveats
+
+- The All-Other column in Summary uses per-store-per-day aggregates → `unique_customers` may double-count cross-store visitors. Captioned in the UI.
+- `new_patient_count` is 0 for the All-Other comparator (requires line-level patient data we don't snapshot for 195 stores).
+- 3 pairs were re-labelled mid-project (pairs 2, 3, 5). Earlier "Test/Control" DiDs in chat history may not match current "Pilot/Non-Pilot" numbers — always trust the dashboard's current numbers.
+
+## Deployment
+
+Pushed to **https://github.com/prsuman1/Price-A-B-May-2026** (private). Streamlit Cloud reads `data_snapshots/sales.parquet`.
+
+**Refresh data deployed:**
+```bash
+.venv/bin/python refresh_snapshots.py   # local, with VPN
+git add data_snapshots/sales.parquet
+git commit -m "refresh sales snapshot"
+git push                                # Streamlit Cloud auto-redeploys
+```
+
+The `refresh_snapshots.py` script pulls ~498K rows for the 14 stores (8 survey ∪ 6 extra pair-control) from `QUANT_BASELINE_START` through today, writes Parquet (~16 MB). `data.py::_load_sales_snapshot()` is the snapshot-first reader; `fetch_sales` / `fetch_quant_sales` fall back to Redshift only when the file is missing.
 
 ## Open items the user should resolve
 

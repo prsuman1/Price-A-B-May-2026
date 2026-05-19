@@ -32,7 +32,12 @@ git commit -m "refresh sales snapshot"
 git push                                  # Streamlit Cloud auto-redeploys
 ```
 
-The script pulls all rows for the 14 stores (union of 8 survey stores + 6 extra pair-control stores) from `QUANT_BASELINE_START` (currently 2026-02-06) through today. Current snapshot ≈ 500K rows, ~16 MB.
+The script writes **three** files into `data_snapshots/`:
+- `sales.parquet` (~16 MB) — line-level rows for the 14 pair-related stores.
+- `store_totals.parquet` (~2 MB) — per-store-per-day-per-bill-set aggregates for ALL ~201 chain stores. Powers the Quant Summary tab's "All-Other Non-Pilot" comparator.
+- `patients_first_seen.parquet` (~0.5 MB) — patient_id → first-ever bill date in chain. Powers the "new patient" KPI.
+
+Combined ~19 MB. Within GitHub's 100 MB/file limit.
 
 ## Inputs (auto-discovered via glob)
 
