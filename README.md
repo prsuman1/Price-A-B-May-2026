@@ -1,9 +1,10 @@
 # Price Change A/B — Insight Dashboard
 
-Two-page Streamlit dashboard for the 2026-05-06 price-change experiment:
+Three-page Streamlit dashboard for the 2026-05-06 price-change experiment:
 
 - **🏪 Store Insight** — surveyor RAG view of customer reactions, joined to Redshift sales.
-- **📊 Quant Insight** — store-pair A/B test of revenue, GM, generic mix, elasticity etc.
+- **📊 Quant Insight** — pilot vs non-pilot A/B test of revenue, GM, generic mix, elasticity etc.
+- **💬 Ask Zeno** — natural-language Q&A over the data via Claude Sonnet 4.6 (OpenRouter).
 
 ## Run locally
 
@@ -45,6 +46,18 @@ Combined ~19 MB. Within GitHub's 100 MB/file limit.
 - `Final Price Change Proposal*.csv` — 346 SKUs whose price went up.
 - `unmatched_numeric_bills.csv` — user-corrected mapping for survey rows where the bill number was entered as a bare numeric value (defensive fallback).
 - `data_snapshots/sales.parquet` — Redshift slice for offline runs (committed to git).
+
+## Chat page
+
+Requires an OpenRouter API key. Add to `.env`:
+
+```
+openrouterkey=sk-or-v1-...
+```
+
+On Streamlit Cloud, add the same key as a secret named `openrouterkey` in the app settings.
+
+Chat history persists to `chat_history.csv`. The file is committed to git, but Streamlit Cloud's file writes are ephemeral per deploy — to keep history permanently across deploys, use the sidebar's "Download chat_history.csv" button periodically and commit the file locally.
 
 ## Notes
 

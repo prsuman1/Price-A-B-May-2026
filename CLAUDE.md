@@ -4,9 +4,10 @@
 
 A Streamlit dashboard that measures customer reaction to a price increase rolled out on **2026-05-06** across **346 SKUs** at a pharmacy chain. A field team sits in 8 stores logging customer behaviour into a Google Form; their replies are joined to Redshift sales data to attribute each reaction to a specific bill, store, and SKU.
 
-The dashboard now has **two pages**:
-- **🏪 Store Insight** — fully built. RAG (red/amber/green) bill-health rollup, store cuts, sentiment cross-tabs, walk-aways, control comparison, drill-down.
-- **📊 Quant Insight** — placeholder; quantitative/financial analysis to be built next.
+The dashboard now has **three pages**:
+- **🏪 Store Insight** — RAG (red/amber/green) bill-health rollup, store cuts, sentiment cross-tabs, walk-aways, control comparison, drill-down.
+- **📊 Quant Insight** — pilot vs non-pilot DiD analysis with Summary / Store-vs-Store / Elasticity / Drill-down tabs.
+- **💬 Ask Zeno** — ask questions in natural language, powered by `anthropic/claude-sonnet-4.6` via OpenRouter; answers from a pre-computed structured summary.
 
 ## Run
 
@@ -25,6 +26,9 @@ Requires VPN to reach `redshift.internal`. `.env` is gitignored and holds Redshi
 | `store_insight.py` | All Store Insight logic — sidebar filters, top KPIs, 6 tabs. |
 | `quant_insight.py` | Placeholder for the Quant Insight page. |
 | `data.py` | Shared data layer: env loader, Redshift connection, CSV loaders (glob-discovered), normalization helpers, `build_joined()` returning the joined dict. All cached with `@st.cache_data(ttl=1800)`. |
+| `chat.py` | Chat page (Streamlit). Renders chat UI, suggested prompts, history download. |
+| `ai_chat.py` | Data layer for chat: `build_context_summary()` (markdown summary of survey + quant), `call_openrouter_stream()` (SSE → text deltas), `append_chat_turn()` / `load_chat_history()`. |
+| `chat_history.csv` | Append-only chat log. Columns: `timestamp,session_id,role,content`. Committed to git. **Note: Streamlit Cloud's file system is ephemeral per deploy** — for permanent persistence, download via the sidebar button and commit locally. |
 | `requirements.txt` | streamlit / pandas / psycopg2-binary / python-dotenv / altair |
 | `.env` | Redshift creds (gitignored). |
 | `.gitignore` | `.env` only. Project is not yet a git repo. |
