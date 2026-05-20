@@ -153,6 +153,9 @@ def build_store_totals(date_from: str, date_to: str, sku_ids: set[int]) -> pd.Da
         agg["promo_discount_promo"] = sub_gross[promo_mask].groupby(grp_keys)["promo_discount"].sum().reindex(agg.index, fill_value=0)
         # Returns.
         agg["return_units"] = g_ret["net_quantity"].sum().abs().reindex(agg.index, fill_value=0)
+        # Units of price-↑ SKU lines only (within this bill-filter subset).
+        pi_lines = sub_gross[sub_gross["drug_id"].isin(sku_ids)]
+        agg["total_units_pi"] = pi_lines.groupby(grp_keys)["net_quantity"].sum().reindex(agg.index, fill_value=0)
         # Repeat patients: per (store, day), patients with ≥2 bills.
         bills_per_pt = (
             sub_gross.dropna(subset=["patient_id"])

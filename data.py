@@ -433,7 +433,7 @@ def aggregate_totals(
         "revenue", "cogs", "promo_discount_total", "bill_count", "unique_customers",
         "generic_units", "ethical_units", "total_units", "generic_revenue",
         "total_revenue", "promo_bills", "promo_discount_promo",
-        "return_units", "total_quantity", "repeat_patient_count",
+        "return_units", "total_quantity", "total_units_pi", "repeat_patient_count",
         "new_patient_count",
     ]
     out = {c: float(sub[c].sum()) if c in sub.columns else 0.0 for c in sum_cols}
