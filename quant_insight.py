@@ -164,6 +164,21 @@ post_to = c4.date_input("Post to", value=QUANT_POST_END)
 
 st.sidebar.caption(f"Pre  : {pre_from} → {pre_to}\nPost : {post_from} → {post_to}")
 
+st.sidebar.markdown("---")
+pair_labels = [f"P{p['pair']}: {p['pilot']} ↔ {p['non_pilot']}" for p in STORE_PAIRS]
+selected_labels = st.sidebar.multiselect(
+    "Pilot pairs",
+    options=pair_labels,
+    default=pair_labels,
+    help="Narrow the analysis to a subset of pilot ↔ non-pilot pairs. Affects all tabs. All-Other comparator stays at chain − all 6 pilots.",
+)
+if not selected_labels:
+    st.warning("Select at least one pair from the sidebar.")
+    st.stop()
+selected_pairs = [p for p, lbl in zip(STORE_PAIRS, pair_labels) if lbl in selected_labels]
+selected_pilots = tuple(p["pilot"] for p in selected_pairs)
+selected_npps = tuple(p["non_pilot"] for p in selected_pairs)
+
 # Bill-set toggle (page-level)
 st.markdown("### Bill set")
 bill_set_label = st.radio(
@@ -219,10 +234,10 @@ with tab_summary:
 
     # Compute KPIs for the 3 groups × pre/post.
     with st.spinner("Computing group KPIs…"):
-        pilot_pre = kpis_for_store_list(PILOT_STORES, pre_from, pre_to)
-        pilot_post = kpis_for_store_list(PILOT_STORES, post_from, post_to)
-        npp_pre = kpis_for_store_list(PAIRED_NON_PILOT_STORES, pre_from, pre_to)
-        npp_post = kpis_for_store_list(PAIRED_NON_PILOT_STORES, post_from, post_to)
+        pilot_pre = kpis_for_store_list(selected_pilots, pre_from, pre_to)
+        pilot_post = kpis_for_store_list(selected_pilots, post_from, post_to)
+        npp_pre = kpis_for_store_list(selected_npps, pre_from, pre_to)
+        npp_post = kpis_for_store_list(selected_npps, post_from, post_to)
 
         if store_totals is not None:
             all_stores_in_chain = set(store_totals["store_name"].unique())
@@ -318,7 +333,7 @@ with tab_pair:
 
     with st.spinner("Loading pair data…"):
         pair_data = {}
-        for p in STORE_PAIRS:
+        for p in selected_pairs:
             pair_data[p["pair"]] = {
                 "pilot_pre":  load_store(p["pilot"], pre_from.isoformat(), pre_to.isoformat()),
                 "pilot_post": load_store(p["pilot"], post_from.isoformat(), post_to.isoformat()),
@@ -327,7 +342,7 @@ with tab_pair:
             }
 
     all_rows = []
-    for p in STORE_PAIRS:
+    for p in selected_pairs:
         d = pair_data[p["pair"]]
         pt = build_pair_table(d["pilot_pre"], d["pilot_post"], d["npp_pre"], d["npp_post"],
                               sku_ids, patient_first_seen, bill_filter)
@@ -338,7 +353,7 @@ with tab_pair:
 
     # Add repeat / churn rows per pair
     rc_rows = []
-    for p in STORE_PAIRS:
+    for p in selected_pairs:
         d = pair_data[p["pair"]]
         t_rc = compute_repeat_churn(d["pilot_pre"], d["pilot_post"], sku_ids if bill_filter == "with_pi" else None)
         c_rc = compute_repeat_churn(d["npp_pre"], d["npp_post"], sku_ids if bill_filter == "with_pi" else None)
@@ -396,11 +411,11 @@ with tab_cohort:
 
     # Build the cohort: patient_ids on pilot-post gross bills under the bill_filter.
     pilot_post_all_df = pd.concat(
-        [load_store(s, post_from.isoformat(), post_to.isoformat()) for s in PILOT_STORES],
+        [load_store(s, post_from.isoformat(), post_to.isoformat()) for s in selected_pilots],
         ignore_index=True,
     )
     pilot_pre_all_df = pd.concat(
-        [load_store(s, pre_from.isoformat(), pre_to.isoformat()) for s in PILOT_STORES],
+        [load_store(s, pre_from.isoformat(), pre_to.isoformat()) for s in selected_pilots],
         ignore_index=True,
     )
 
@@ -479,11 +494,11 @@ with tab_elast:
     )
 
     pilot_pre_all = pd.concat(
-        [load_store(s, pre_from.isoformat(), pre_to.isoformat()) for s in PILOT_STORES],
+        [load_store(s, pre_from.isoformat(), pre_to.isoformat()) for s in selected_pilots],
         ignore_index=True,
     )
     pilot_post_all = pd.concat(
-        [load_store(s, post_from.isoformat(), post_to.isoformat()) for s in PILOT_STORES],
+        [load_store(s, post_from.isoformat(), post_to.isoformat()) for s in selected_pilots],
         ignore_index=True,
     )
 
@@ -532,9 +547,9 @@ with tab_elast:
 # ----- Tab 5: Drill-down -----------------------------------------------------
 with tab_drill:
     st.subheader("Bill-level drill-down")
-    pair_labels = [f"P{p['pair']} · {p['pilot']} (pilot) vs {p['non_pilot']}" for p in STORE_PAIRS]
-    drill_pair_label = st.selectbox("Pick a pair", options=pair_labels)
-    dp = next(p for p, lbl in zip(STORE_PAIRS, pair_labels) if lbl == drill_pair_label)
+    drill_labels = [f"P{p['pair']} · {p['pilot']} (pilot) vs {p['non_pilot']}" for p in selected_pairs]
+    drill_pair_label = st.selectbox("Pick a pair", options=drill_labels)
+    dp = next(p for p, lbl in zip(selected_pairs, drill_labels) if lbl == drill_pair_label)
     side = st.radio("Side", ["Pilot", "Non-Pilot"], horizontal=True)
     window = st.radio("Window", ["Pre", "Post"], horizontal=True, index=1)
     store = dp["pilot"] if side == "Pilot" else dp["non_pilot"]
