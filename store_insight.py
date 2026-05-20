@@ -8,7 +8,10 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from data import GO_LIVE_DATE, RAG_COLORS, RAG_EMOJI, STORE_MAP, build_joined, write_clean_bill_ids_csv
+from data import (
+    GO_LIVE_DATE, RAG_COLORS, RAG_EMOJI, STORE_MAP,
+    _load_partial_bill_snapshot, build_joined, write_clean_bill_ids_csv,
+)
 
 # Display palette for the 4 chart segments (amber split into partial/genrtn).
 SEGMENT_COLORS = {
@@ -188,6 +191,7 @@ st.download_button(
     tab_store,
     tab_sent,
     tab_walk,
+    tab_partial,
     tab_ctrl,
     tab_drill,
 ) = st.tabs([
@@ -195,6 +199,7 @@ st.download_button(
     "Store cut",
     "Sentiment cross-tabs",
     "Walk-aways",
+    "Partial-bill retention",
     "Control comparison",
     "Drill-down",
 ])
@@ -499,6 +504,94 @@ with tab_walk:
         per_store = per_store.reset_index()
         st.bar_chart(per_store.set_index("store")["walkaways"])
         st.dataframe(per_store, width='stretch')
+
+# ---- Partial-bill retention -------------------------------------------------
+with tab_partial:
+    st.subheader("Partial-bill cohort: did they keep buying price-↑ SKUs?")
+    st.caption(
+        "Cohort = patients flagged AMBER-partial on a bill (surveyor said they dropped items). "
+        "For each, we check their **4-month pre-go-live** history of price-↑ SKUs across **all "
+        "chain stores**, then whether they re-bought the SAME SKUs after the price hike."
+    )
+
+    pb_hist = _load_partial_bill_snapshot()
+    if pb_hist is None or pb_hist.empty:
+        st.warning(
+            "`data_snapshots/partial_bill_history.parquet` missing or empty. "
+            "Run `python refresh_snapshots.py` locally with VPN to generate it."
+        )
+    else:
+        partial_bills = fsurvey[fsurvey["is_amber_partial"].fillna(False)].copy()
+        st.markdown(f"**Partial-bill cohort:** {pb_hist['patient_id'].nunique():,} unique patients · {len(pb_hist):,} purchase rows of price-↑ SKUs across 4-month pre + post.")
+
+        gross = pb_hist[pb_hist["bill_flag"] == "gross"].copy()
+        go_live = GO_LIVE_DATE.date()
+        gross["period"] = gross["day"].apply(lambda d: "pre" if d < go_live else "post")
+
+        # Per-patient × per-SKU pivot
+        per_ps = (
+            gross.groupby(["patient_id", "drug_id", "drug_name", "period"])
+            ["net_quantity"].sum().unstack("period", fill_value=0).reset_index()
+        )
+        per_ps["pre"] = per_ps.get("pre", 0)
+        per_ps["post"] = per_ps.get("post", 0)
+        per_ps["continued"] = (per_ps["pre"] > 0) & (per_ps["post"] > 0)
+        per_ps["lapsed"] = (per_ps["pre"] > 0) & (per_ps["post"] <= 0)
+
+        # Per-patient summary
+        per_patient = (
+            per_ps.groupby("patient_id").agg(
+                n_pi_skus_pre=("pre", lambda s: int((s > 0).sum())),
+                n_pi_skus_continued=("continued", "sum"),
+                n_pi_skus_lapsed=("lapsed", "sum"),
+                total_qty_pre=("pre", "sum"),
+                total_qty_post=("post", "sum"),
+            ).reset_index()
+        )
+        per_patient["sku_retention_rate"] = (
+            per_patient["n_pi_skus_continued"] /
+            per_patient["n_pi_skus_pre"].replace(0, pd.NA)
+        ).round(3)
+        per_patient = per_patient.sort_values("n_pi_skus_pre", ascending=False)
+
+        # Headline metrics
+        hc1, hc2, hc3 = st.columns(3)
+        hc1.metric("Patients with pre-go-live price-↑ history",
+                    int((per_patient["n_pi_skus_pre"] > 0).sum()))
+        any_continued = int((per_patient["n_pi_skus_continued"] > 0).sum())
+        hc2.metric("Of those, ≥1 SKU continued post", any_continued)
+        all_lapsed = int(((per_patient["n_pi_skus_pre"] > 0) & (per_patient["n_pi_skus_continued"] == 0)).sum())
+        hc3.metric("All price-↑ SKUs lapsed post", all_lapsed)
+
+        st.markdown("**Per-patient summary**")
+        st.dataframe(per_patient, width='stretch', hide_index=True)
+
+        # Per-SKU retention rollup
+        st.markdown("**Per-SKU retention (within the partial-bill cohort)**")
+        per_sku = (
+            per_ps.groupby(["drug_id", "drug_name"]).agg(
+                n_patients_pre=("pre", lambda s: int((s > 0).sum())),
+                n_patients_continued=("continued", "sum"),
+                total_qty_pre=("pre", "sum"),
+                total_qty_post=("post", "sum"),
+            ).reset_index()
+        )
+        per_sku = per_sku[per_sku["n_patients_pre"] > 0]
+        per_sku["sku_retention_rate"] = (
+            per_sku["n_patients_continued"] / per_sku["n_patients_pre"]
+        ).round(3)
+        per_sku = per_sku.sort_values("n_patients_pre", ascending=False)
+        st.dataframe(
+            per_sku, width='stretch', hide_index=True,
+            column_config={"drug_name": st.column_config.Column(pinned=True)},
+        )
+
+        st.download_button(
+            "📥 Download partial-bill cohort retention (CSV)",
+            data=per_patient.to_csv(index=False).encode("utf-8"),
+            file_name="partial_bill_retention_per_patient.csv",
+            mime="text/csv",
+        )
 
 # ---- Control comparison -----------------------------------------------------
 with tab_ctrl:

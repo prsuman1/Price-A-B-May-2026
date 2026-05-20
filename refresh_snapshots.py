@@ -29,6 +29,8 @@ from data import (
     ASSORTMENT_GENERIC,
     ASSORTMENT_ETHICAL,
     COUPON_PREFIX,
+    GO_LIVE_DATE,
+    PARTIAL_BILL_SNAPSHOT,
     PATIENTS_SNAPSHOT,
     QUANT_BASELINE_START,
     SALES_SNAPSHOT,
@@ -37,6 +39,7 @@ from data import (
     STORE_TOTALS_SNAPSHOT,
     STORE_MAP,
     _connect,
+    build_joined,
     load_skus,
 )
 
@@ -277,8 +280,61 @@ def main() -> int:
     print(f"  → {STORE_TOTALS_SNAPSHOT.name}: {len(totals):,} rows · {STORE_TOTALS_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print(f"     stores: {totals['store_name'].nunique()}, days: {totals['day'].nunique()}, bill_filters: {totals['bill_filter'].nunique()}")
     print()
+
+    # 4) Partial-bill cohort: 4-month pre + post price-↑ SKU history (ALL stores).
+    print(f"[4/4] Partial-bill cohort history…")
+    bundle = build_joined()
+    pb_bills = bundle["bills"]
+    pb_bills = pb_bills[pb_bills["is_amber_partial"].fillna(False)]
+    partial_patient_ids = sorted({int(x) for x in pb_bills["patient_id"].dropna().unique()})
+    print(f"  Partial-bill patients: {len(partial_patient_ids)}")
+
+    pb_history = _fetch_partial_bill_history(partial_patient_ids, sku_ids)
+    pb_history.to_parquet(PARTIAL_BILL_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
+    print(f"  → {PARTIAL_BILL_SNAPSHOT.name}: {len(pb_history):,} rows · {PARTIAL_BILL_SNAPSHOT.stat().st_size/1e6:.1f} MB")
+    print(f"     date range: {pb_history['day'].min()} → {pb_history['day'].max()}" if len(pb_history) else "     (empty)")
+    print()
     print("Done.")
     return 0
+
+
+def _fetch_partial_bill_history(patient_ids: list[int], sku_ids: set[int]) -> pd.DataFrame:
+    """For the partial-bill patients, pull their price-↑ SKU history from
+    2026-01-06 (4 months pre-go-live) through today across ALL chain stores."""
+    if not patient_ids or not sku_ids:
+        return pd.DataFrame(columns=["patient_id", "drug_id", "drug_name", "day",
+                                       "store_name", "net_quantity", "revenue_value", "bill_flag"])
+    pre_start = (GO_LIVE_DATE.date() - dt.timedelta(days=120)).isoformat()
+    today = dt.date.today().isoformat()
+    sku_tuple = tuple(int(x) for x in sorted(sku_ids))
+    rows: list[tuple] = []
+    chunk = 1000
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for i in range(0, len(patient_ids), chunk):
+                batch = tuple(patient_ids[i:i+chunk])
+                cur.execute(
+                    """
+                    SELECT "patient-id","drug-id","drug-name","created-at"::date AS day,
+                           "store-name","net-quantity","revenue-value","bill-flag"
+                    FROM "prod2-generico"."sales"
+                    WHERE "patient-id" IN %s
+                      AND "drug-id" IN %s
+                      AND "created-at"::date BETWEEN %s AND %s
+                    """,
+                    (batch, sku_tuple, pre_start, today),
+                )
+                rows.extend(cur.fetchall())
+    df = pd.DataFrame(rows, columns=["patient_id", "drug_id", "drug_name", "day",
+                                       "store_name", "net_quantity", "revenue_value", "bill_flag"])
+    df["patient_id"] = pd.to_numeric(df["patient_id"], errors="coerce").astype("Int64")
+    df["drug_id"] = pd.to_numeric(df["drug_id"], errors="coerce").astype("Int64")
+    df["net_quantity"] = pd.to_numeric(df["net_quantity"], errors="coerce").fillna(0).astype("Float64")
+    df["revenue_value"] = pd.to_numeric(df["revenue_value"], errors="coerce").fillna(0).astype("Float64")
+    df["bill_flag"] = df["bill_flag"].astype(str)
+    df["drug_name"] = df["drug_name"].astype(str)
+    df["store_name"] = df["store_name"].astype(str)
+    return df
 
 
 if __name__ == "__main__":

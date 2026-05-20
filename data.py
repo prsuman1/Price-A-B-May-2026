@@ -44,6 +44,7 @@ SNAPSHOTS_DIR = PROJECT_DIR / "data_snapshots"
 SALES_SNAPSHOT = SNAPSHOTS_DIR / "sales.parquet"           # line-level, 14 stores
 STORE_TOTALS_SNAPSHOT = SNAPSHOTS_DIR / "store_totals.parquet"   # per-store-per-day-per-bill-set KPI totals, ALL chain stores
 PATIENTS_SNAPSHOT = SNAPSHOTS_DIR / "patients_first_seen.parquet"  # patient_id -> first_seen_date
+PARTIAL_BILL_SNAPSHOT = SNAPSHOTS_DIR / "partial_bill_history.parquet"  # partial-bill patients' price-↑ SKU history, all stores
 
 # Known surveyor-typo prefixes — applied after Z-strip + uppercase in serial normalization.
 PREFIX_FIXES = {"KEWT": "KRWT"}
@@ -65,12 +66,12 @@ STORE_PAIRS = [
 ]
 PILOT_STORES = tuple(p["pilot"] for p in STORE_PAIRS)
 PAIRED_NON_PILOT_STORES = tuple(p["non_pilot"] for p in STORE_PAIRS)
-QUANT_PRE_START = pd.Timestamp("2026-04-24").date()
+QUANT_PRE_START = pd.Timestamp("2026-04-22").date()
 QUANT_PRE_END = pd.Timestamp("2026-05-05").date()
 QUANT_POST_START = pd.Timestamp("2026-05-06").date()
-QUANT_POST_END = pd.Timestamp("2026-05-17").date()
+QUANT_POST_END = pd.Timestamp("2026-05-19").date()
 QUANT_BASELINE_START = pd.Timestamp("2026-02-06").date()
-QUANT_BASELINE_END = pd.Timestamp("2026-04-23").date()
+QUANT_BASELINE_END = pd.Timestamp("2026-04-21").date()
 ASSORTMENT_GENERIC = (3, 4)   # Generic + Generic-Speciality
 ASSORTMENT_ETHICAL = (1, 2)   # Ethical + Ethical-Speciality
 
@@ -730,8 +731,8 @@ def compute_kpis(
         "generic_mix_units_pct", "generic_revenue", "total_revenue",
         "generic_mix_revenue_pct", "promo_bills", "promo_usage_rate",
         "promo_share_revenue", "return_units", "return_rate",
-        "total_quantity", "repeat_patient_count", "new_patient_count",
-        "items_per_bill", "revenue_per_patient",
+        "total_quantity", "total_units_pi", "repeat_patient_count",
+        "new_patient_count", "items_per_bill", "revenue_per_patient",
     ]}
     if df.empty: return empty
 
@@ -787,6 +788,11 @@ def compute_kpis(
     total_quantity = total_units  # alias — "total quantity" is just total_units
     items_per_bill = (total_quantity / bill_count) if bill_count else 0.0
     revenue_per_patient = (revenue / unique_customers) if unique_customers else 0.0
+    # Phase 8: units of price-↑ SKUs only (subset of total_units, on gross bills)
+    total_units_pi = (
+        float(gross.loc[gross["drug_id"].isin(sku_ids), "net_quantity"].sum())
+        if sku_ids is not None else 0.0
+    )
 
     # Repeat patient = patient with ≥2 distinct bills inside this slice.
     bills_per_patient = (
@@ -821,6 +827,7 @@ def compute_kpis(
         "promo_share_revenue": promo_share_revenue,
         "return_units": return_units, "return_rate": return_rate,
         "total_quantity": total_quantity,
+        "total_units_pi": total_units_pi,
         "repeat_patient_count": repeat_patient_count,
         "new_patient_count": new_patient_count,
         "items_per_bill": items_per_bill,
@@ -916,3 +923,45 @@ def compute_elasticity(pre_df: pd.DataFrame, post_df: pd.DataFrame,
                               / sku["pre_avg_price"].replace(0, pd.NA)) * 100
     sku["own_elasticity"] = sku["units_delta_pct"] / sku["price_delta_pct"].replace(0, pd.NA)
     return sku.reset_index()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_partial_bill_snapshot() -> pd.DataFrame | None:
+    """Load partial-bill cohort history: their 4-month pre + post purchases of
+    price-↑ SKUs across all chain stores. Returns None if missing."""
+    if not PARTIAL_BILL_SNAPSHOT.exists():
+        return None
+    df = pd.read_parquet(PARTIAL_BILL_SNAPSHOT)
+    if "day" in df.columns:
+        df["day"] = pd.to_datetime(df["day"], errors="coerce").dt.date
+    return df
+
+
+def compute_cohort_sku_pre_post(
+    pre_df: pd.DataFrame, post_df: pd.DataFrame,
+    cohort_patient_ids: set[int], sku_ids: set[int],
+) -> pd.DataFrame:
+    """For a fixed patient cohort, per-SKU pre vs post quantity and revenue.
+    Both DataFrames should be pre-filtered to the relevant stores (e.g. pilot).
+    Restricts to gross bills and price-↑ SKU drug_ids. Drug names are NOT
+    included here — caller can merge with `load_skus()` for those."""
+    def slice_for_cohort(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty: return df
+        g = df[df["bill_flag"] == "gross"]
+        g = g[g["patient_id"].astype("Int64").isin(cohort_patient_ids)]
+        g = g[g["drug_id"].astype("Int64").isin(sku_ids)]
+        return g
+
+    pre = slice_for_cohort(pre_df)
+    post = slice_for_cohort(post_df)
+
+    pre_agg = pre.groupby("drug_id").agg(pre_qty=("net_quantity", "sum"),
+                                          pre_revenue=("revenue_value", "sum"))
+    post_agg = post.groupby("drug_id").agg(post_qty=("net_quantity", "sum"),
+                                            post_revenue=("revenue_value", "sum"))
+    out = pre_agg.join(post_agg, how="outer").fillna(0).reset_index()
+    out["delta_qty"] = out["post_qty"] - out["pre_qty"]
+    out["delta_qty_pct"] = (out["delta_qty"] / out["pre_qty"].replace(0, pd.NA)) * 100
+    cols = ["drug_id", "pre_qty", "post_qty", "delta_qty",
+            "delta_qty_pct", "pre_revenue", "post_revenue"]
+    return out[cols].sort_values("post_qty", ascending=False)

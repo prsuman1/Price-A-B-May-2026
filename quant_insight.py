@@ -29,6 +29,7 @@ from data import (
     _load_store_totals_snapshot,
     aggregate_totals,
     build_pair_table,
+    compute_cohort_sku_pre_post,
     compute_elasticity,
     compute_kpis,
     compute_repeat_churn,
@@ -42,7 +43,8 @@ KPI_DIRECTION = {
     # ↑ good
     "revenue": +1, "gm": +1, "gm_pct": +1, "aov": +1, "aom": +1, "acm": +1,
     "frequency": +1, "bill_count": +1, "unique_customers": +1,
-    "total_quantity": +1, "items_per_bill": +1, "revenue_per_patient": +1,
+    "total_quantity": +1, "total_units_pi": +1,
+    "items_per_bill": +1, "revenue_per_patient": +1,
     "repeat_patient_count": +1, "new_patient_count": +1,
     "repeat_rate": +1,
     # ↓ good
@@ -62,6 +64,7 @@ KPI_LABELS = {
     "unique_customers": "Patients",
     "frequency": "Frequency (bills/patient)",
     "total_quantity": "Total units",
+    "total_units_pi": "Total units (price-↑ SKUs)",
     "items_per_bill": "Items per bill",
     "revenue_per_patient": "Revenue per patient (₹)",
     "repeat_patient_count": "Repeat patients (≥2 bills in window)",
@@ -78,7 +81,7 @@ KPI_LABELS = {
 # KPI groupings for the section dividers
 KPI_GROUPS = [
     ("Volume",       ["bill_count", "unique_customers", "total_quantity",
-                       "repeat_patient_count", "new_patient_count"]),
+                       "total_units_pi", "repeat_patient_count", "new_patient_count"]),
     ("Revenue & Margin", ["revenue", "gm", "gm_pct"]),
     ("Per bill / per patient", ["aov", "aom", "acm", "items_per_bill",
                                  "revenue_per_patient", "frequency"]),
@@ -102,7 +105,7 @@ def fmt_value(kpi: str, v) -> str:
     if kpi in ("revenue", "gm", "aov", "aom", "acm", "revenue_per_patient"):
         return f"₹{v:,.0f}"
     if kpi in ("bill_count", "unique_customers", "total_quantity",
-                "repeat_patient_count", "new_patient_count"):
+                "total_units_pi", "repeat_patient_count", "new_patient_count"):
         return f"{int(v):,}"
     return f"{v:.2f}"
 
@@ -128,6 +131,16 @@ st.title("Quant Insight — Pilot vs Non-Pilot")
 st.caption(
     "**Pilot** = 6 Mumbai stores where the price increase was applied on 2026-05-06. "
     "**Non-Pilot** = paired control stores (unchanged). **DiD** = Pilot Δ% − Non-Pilot Δ%."
+)
+
+from data import QUANT_BASELINE_START, QUANT_BASELINE_END
+st.markdown(
+    f"<div style='background:#F8F9FA;padding:8px 12px;border-radius:6px;font-size:0.9em;'>"
+    f"📅 <b>Data windows</b>: "
+    f"Baseline <code>{QUANT_BASELINE_START} → {QUANT_BASELINE_END}</code> "
+    f"(parity check) · Pre <code>{QUANT_PRE_START} → {QUANT_PRE_END}</code> · "
+    f"Post <code>{QUANT_POST_START} → {QUANT_POST_END}</code></div>",
+    unsafe_allow_html=True,
 )
 
 skus = load_skus()
@@ -186,9 +199,10 @@ def kpis_for_store_list(stores: tuple[str, ...], date_from, date_to) -> dict:
 # Tabs
 # ============================================================================
 
-tab_summary, tab_pair, tab_elast, tab_drill = st.tabs([
+tab_summary, tab_pair, tab_cohort, tab_elast, tab_drill = st.tabs([
     "🏪 Summary",
     "🔀 Store vs Store",
+    "🎯 Cohort SKU pre/post",
     "📈 Elasticity",
     "🔍 Drill-down",
 ])
@@ -370,7 +384,93 @@ with tab_pair:
         )
 
 
-# ----- Tab 3: Elasticity -----------------------------------------------------
+# ----- Tab 3: Cohort SKU pre/post -------------------------------------------
+with tab_cohort:
+    st.subheader("Cohort: same patients, pre vs post by price-↑ SKU")
+    st.caption(
+        "Cohort = the patients shown in the Summary tab (pilot stores, post window, "
+        "under the current bill-set filter). For those **same patient IDs**, this view "
+        "compares their pre- vs post-window quantity in **pilot stores only**, restricted "
+        "to the 346 price-↑ SKUs. Apples-to-apples geography and population."
+    )
+
+    # Build the cohort: patient_ids on pilot-post gross bills under the bill_filter.
+    pilot_post_all_df = pd.concat(
+        [load_store(s, post_from.isoformat(), post_to.isoformat()) for s in PILOT_STORES],
+        ignore_index=True,
+    )
+    pilot_pre_all_df = pd.concat(
+        [load_store(s, pre_from.isoformat(), pre_to.isoformat()) for s in PILOT_STORES],
+        ignore_index=True,
+    )
+
+    # Apply bill_filter to derive the cohort (same logic as compute_kpis).
+    def apply_bill_filter(df):
+        if df.empty or bill_filter == "all": return df
+        gross_all = df[df["bill_flag"] == "gross"]
+        pi_bill_ids = set(gross_all.loc[gross_all["drug_id"].astype("Int64").isin(sku_ids), "bill_id"].dropna().unique())
+        if bill_filter == "with_pi":
+            return df[df["bill_id"].isin(pi_bill_ids)]
+        else:  # without_pi
+            all_ids = set(gross_all["bill_id"].dropna().unique())
+            return df[df["bill_id"].isin(all_ids - pi_bill_ids)]
+
+    cohort_post_df = apply_bill_filter(pilot_post_all_df)
+    cohort_pre_df = apply_bill_filter(pilot_pre_all_df)
+    cohort_ids = set(int(x) for x in cohort_post_df.loc[cohort_post_df["bill_flag"] == "gross", "patient_id"].dropna().unique())
+
+    st.markdown(f"**Cohort size:** {len(cohort_ids):,} patients (pilot stores, post window, `{bill_filter}`).")
+
+    if not cohort_ids:
+        st.info("No patients in the cohort for this filter.")
+    else:
+        cohort_table = compute_cohort_sku_pre_post(pilot_pre_all_df, pilot_post_all_df, cohort_ids, sku_ids)
+        # Drop rows with both 0 (SKUs the cohort never touched)
+        cohort_table = cohort_table[(cohort_table["pre_qty"] > 0) | (cohort_table["post_qty"] > 0)]
+        # Merge drug_name + old/new price + drug_type from the SKU CSV
+        cohort_table = cohort_table.merge(
+            skus[["drug_id", "drug_name", "old_price", "new_price", "drug_type"]],
+            on="drug_id", how="left",
+        )
+        cohort_table = cohort_table[[
+            "drug_id", "drug_name", "drug_type", "old_price", "new_price",
+            "pre_qty", "post_qty", "delta_qty", "delta_qty_pct",
+            "pre_revenue", "post_revenue",
+        ]]
+        cohort_table[["pre_qty", "post_qty", "delta_qty"]] = cohort_table[
+            ["pre_qty", "post_qty", "delta_qty"]
+        ].astype(int)
+        cohort_table["pre_revenue"] = cohort_table["pre_revenue"].round(0)
+        cohort_table["post_revenue"] = cohort_table["post_revenue"].round(0)
+        cohort_table["delta_qty_pct"] = cohort_table["delta_qty_pct"].round(1)
+
+        n_skus = len(cohort_table)
+        total_pre = int(cohort_table["pre_qty"].sum())
+        total_post = int(cohort_table["post_qty"].sum())
+        delta_total = total_post - total_pre
+        delta_pct = (delta_total / total_pre * 100) if total_pre else 0
+        st.markdown(
+            f"**{n_skus} SKUs** touched in either window by the cohort · "
+            f"Total qty: pre **{total_pre:,}** → post **{total_post:,}** "
+            f"(Δ **{delta_total:+,}**, **{delta_pct:+.1f}%**)."
+        )
+        st.dataframe(
+            cohort_table,
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "drug_name": st.column_config.Column(pinned=True),
+            },
+        )
+        st.download_button(
+            "📥 Download cohort SKU table",
+            data=cohort_table.to_csv(index=False).encode("utf-8"),
+            file_name="cohort_sku_pre_post.csv",
+            mime="text/csv",
+        )
+
+
+# ----- Tab 4: Elasticity -----------------------------------------------------
 with tab_elast:
     st.subheader("SKU-level elasticity (Pilot stores)")
     st.caption(
@@ -429,7 +529,7 @@ with tab_elast:
                help="Positive = customers substituted toward ethical when generic price rose.")
 
 
-# ----- Tab 4: Drill-down -----------------------------------------------------
+# ----- Tab 5: Drill-down -----------------------------------------------------
 with tab_drill:
     st.subheader("Bill-level drill-down")
     pair_labels = [f"P{p['pair']} · {p['pilot']} (pilot) vs {p['non_pilot']}" for p in STORE_PAIRS]
