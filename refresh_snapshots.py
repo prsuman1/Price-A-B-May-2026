@@ -34,6 +34,7 @@ from data import (
     PATIENTS_SNAPSHOT,
     QUANT_BASELINE_START,
     SALES_SNAPSHOT,
+    SKU_CATEGORY_SNAPSHOT,
     SNAPSHOTS_DIR,
     STORE_PAIRS,
     STORE_TOTALS_SNAPSHOT,
@@ -80,7 +81,34 @@ def fetch_sales_snapshot(stores: tuple[str, ...], date_from: str, date_to: str) 
     return df
 
 
-def build_store_totals(date_from: str, date_to: str, sku_ids: set[int]) -> pd.DataFrame:
+def fetch_sku_category(sku_ids: set[int]) -> pd.DataFrame:
+    """drug_id -> category lookup for the 346 price-↑ SKUs (one Redshift query).
+    Falls back to 'unknown' if a drug_id isn't present in any sales row."""
+    if not sku_ids:
+        return pd.DataFrame(columns=["drug_id", "category"])
+    sku_tuple = tuple(int(x) for x in sorted(sku_ids))
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT "drug-id", "category", COUNT(*) AS n
+                FROM "prod2-generico"."sales"
+                WHERE "drug-id" IN %s
+                GROUP BY "drug-id", "category"
+                """,
+                (sku_tuple,),
+            )
+            rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=["drug_id", "category", "n"])
+    # If a drug has multiple category labels across rows, keep the most common.
+    df = df.sort_values(["drug_id", "n"], ascending=[True, False]).drop_duplicates("drug_id", keep="first")
+    df["category"] = df["category"].fillna("unknown").astype(str)
+    df["drug_id"] = df["drug_id"].astype(int)
+    return df[["drug_id", "category"]]
+
+
+def build_store_totals(date_from: str, date_to: str, sku_ids: set[int],
+                       sku_category: dict[int, str] | None = None) -> pd.DataFrame:
     """For ALL chain stores, pre-aggregate per-store-per-day KPI totals into
     a small Parquet. Two rows per (store, day) — one for `with_pi`, one for
     `without_pi`."""
@@ -154,8 +182,20 @@ def build_store_totals(date_from: str, date_to: str, sku_ids: set[int]) -> pd.Da
         # Returns.
         agg["return_units"] = g_ret["net_quantity"].sum().abs().reindex(agg.index, fill_value=0)
         # Units of price-↑ SKU lines only (within this bill-filter subset).
-        pi_lines = sub_gross[sub_gross["drug_id"].isin(sku_ids)]
+        pi_lines = sub_gross[sub_gross["drug_id"].isin(sku_ids)].copy()
         agg["total_units_pi"] = pi_lines.groupby(grp_keys)["net_quantity"].sum().reindex(agg.index, fill_value=0)
+        # Per-category split of price-↑ units (chronic / acute / therapy cycle).
+        if sku_category and not pi_lines.empty:
+            pi_lines["_cat"] = pi_lines["drug_id"].map(lambda d: sku_category.get(int(d), "unknown"))
+            for col, cat_label in [("pi_units_chronic", "chronic"),
+                                    ("pi_units_acute", "acute"),
+                                    ("pi_units_therapy_cycle", "therapy cycle")]:
+                sub_cat = pi_lines[pi_lines["_cat"] == cat_label]
+                agg[col] = sub_cat.groupby(grp_keys)["net_quantity"].sum().reindex(agg.index, fill_value=0)
+        else:
+            agg["pi_units_chronic"] = 0
+            agg["pi_units_acute"] = 0
+            agg["pi_units_therapy_cycle"] = 0
         # Repeat patients: per (store, day), patients with ≥2 bills.
         bills_per_pt = (
             sub_gross.dropna(subset=["patient_id"])
@@ -260,32 +300,41 @@ def main() -> int:
     print()
 
     # 1) Line-level sales for the 14 pair-related stores.
-    print(f"[1/3] Line-level sales for {len(pair_related_stores)} pair-related stores…")
+    print(f"[1/5] Line-level sales for {len(pair_related_stores)} pair-related stores…")
     sales = fetch_sales_snapshot(pair_related_stores, date_from, date_to)
     sales.to_parquet(SALES_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
     print(f"  → {SALES_SNAPSHOT.name}: {len(sales):,} rows · {SALES_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print()
 
     # 2) Patients-first-seen for the 14 stores' patients.
-    print(f"[2/3] Patients first-seen…")
+    print(f"[2/5] Patients first-seen…")
     patients = build_patients_first_seen(pair_related_stores, date_from, date_to)
     patients.to_parquet(PATIENTS_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
     print(f"  → {PATIENTS_SNAPSHOT.name}: {len(patients):,} patients · {PATIENTS_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print()
 
-    # 3) Per-store-per-day-per-bill-set totals for ALL chain stores.
-    print(f"[3/3] Per-store-per-day aggregates (ALL stores)…")
+    # 3) SKU category lookup (small file).
+    print(f"[3/5] SKU category lookup for price-↑ SKUs…")
     skus = load_skus()
     sku_ids = set(skus["drug_id"].astype(int))
-    totals = build_store_totals(date_from, date_to, sku_ids)
+    sku_cat_df = fetch_sku_category(sku_ids)
+    sku_cat_df.to_parquet(SKU_CATEGORY_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
+    sku_cat_lookup = dict(zip(sku_cat_df["drug_id"], sku_cat_df["category"]))
+    print(f"  → {SKU_CATEGORY_SNAPSHOT.name}: {len(sku_cat_df)} SKUs · {SKU_CATEGORY_SNAPSHOT.stat().st_size/1e3:.1f} KB")
+    print(f"     categories: {dict(sku_cat_df['category'].value_counts())}")
+    print()
+
+    # 4) Per-store-per-day-per-bill-set totals for ALL chain stores.
+    print(f"[4/5] Per-store-per-day aggregates (ALL stores)…")
+    totals = build_store_totals(date_from, date_to, sku_ids, sku_category=sku_cat_lookup)
     totals = fill_new_patient_count(totals, patients)
     totals.to_parquet(STORE_TOTALS_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
     print(f"  → {STORE_TOTALS_SNAPSHOT.name}: {len(totals):,} rows · {STORE_TOTALS_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print(f"     stores: {totals['store_name'].nunique()}, days: {totals['day'].nunique()}, bill_filters: {totals['bill_filter'].nunique()}")
     print()
 
-    # 4) Partial-bill cohort: 4-month pre + post price-↑ SKU history (ALL stores).
-    print(f"[4/4] Partial-bill cohort history…")
+    # 5) Partial-bill cohort: 4-month pre + post price-↑ SKU history (ALL stores).
+    print(f"[5/5] Partial-bill cohort history…")
     bundle = build_joined()
     pb_bills = bundle["bills"]
     pb_bills = pb_bills[pb_bills["is_amber_partial"].fillna(False)]

@@ -45,6 +45,7 @@ SALES_SNAPSHOT = SNAPSHOTS_DIR / "sales.parquet"           # line-level, 14 stor
 STORE_TOTALS_SNAPSHOT = SNAPSHOTS_DIR / "store_totals.parquet"   # per-store-per-day-per-bill-set KPI totals, ALL chain stores
 PATIENTS_SNAPSHOT = SNAPSHOTS_DIR / "patients_first_seen.parquet"  # patient_id -> first_seen_date
 PARTIAL_BILL_SNAPSHOT = SNAPSHOTS_DIR / "partial_bill_history.parquet"  # partial-bill patients' price-↑ SKU history, all stores
+SKU_CATEGORY_SNAPSHOT = SNAPSHOTS_DIR / "sku_category.parquet"  # drug_id → category lookup for price-↑ SKUs
 
 # Known surveyor-typo prefixes — applied after Z-strip + uppercase in serial normalization.
 PREFIX_FIXES = {"KEWT": "KRWT"}
@@ -435,6 +436,7 @@ def aggregate_totals(
         "total_revenue", "promo_bills", "promo_discount_promo",
         "return_units", "total_quantity", "total_units_pi", "repeat_patient_count",
         "new_patient_count",
+        "pi_units_chronic", "pi_units_acute", "pi_units_therapy_cycle",
     ]
     out = {c: float(sub[c].sum()) if c in sub.columns else 0.0 for c in sum_cols}
     out["gm"] = out["revenue"] - out["cogs"] - out["promo_discount_total"]
@@ -733,6 +735,7 @@ def compute_kpis(
         "promo_share_revenue", "return_units", "return_rate",
         "total_quantity", "total_units_pi", "repeat_patient_count",
         "new_patient_count", "items_per_bill", "revenue_per_patient",
+        "pi_units_chronic", "pi_units_acute", "pi_units_therapy_cycle",
     ]}
     if df.empty: return empty
 
@@ -793,6 +796,17 @@ def compute_kpis(
         float(gross.loc[gross["drug_id"].isin(sku_ids), "net_quantity"].sum())
         if sku_ids is not None else 0.0
     )
+    # Phase 10: split price-↑ units by chronic / acute / therapy_cycle
+    pi_units_chronic = pi_units_acute = pi_units_therapy_cycle = 0.0
+    if sku_ids is not None:
+        cat_lookup = _load_sku_category()
+        if cat_lookup:
+            pi_lines = gross[gross["drug_id"].isin(sku_ids)].copy()
+            pi_lines["_cat"] = pi_lines["drug_id"].map(lambda d: cat_lookup.get(int(d), "unknown"))
+            by_cat = pi_lines.groupby("_cat")["net_quantity"].sum()
+            pi_units_chronic = float(by_cat.get("chronic", 0))
+            pi_units_acute = float(by_cat.get("acute", 0))
+            pi_units_therapy_cycle = float(by_cat.get("therapy cycle", 0))
 
     # Repeat patient = patient with ≥2 distinct bills inside this slice.
     bills_per_patient = (
@@ -828,6 +842,9 @@ def compute_kpis(
         "return_units": return_units, "return_rate": return_rate,
         "total_quantity": total_quantity,
         "total_units_pi": total_units_pi,
+        "pi_units_chronic": pi_units_chronic,
+        "pi_units_acute": pi_units_acute,
+        "pi_units_therapy_cycle": pi_units_therapy_cycle,
         "repeat_patient_count": repeat_patient_count,
         "new_patient_count": new_patient_count,
         "items_per_bill": items_per_bill,
@@ -923,6 +940,17 @@ def compute_elasticity(pre_df: pd.DataFrame, post_df: pd.DataFrame,
                               / sku["pre_avg_price"].replace(0, pd.NA)) * 100
     sku["own_elasticity"] = sku["units_delta_pct"] / sku["price_delta_pct"].replace(0, pd.NA)
     return sku.reset_index()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_sku_category() -> dict[int, str]:
+    """Load `drug_id -> category` lookup for price-↑ SKUs. Returns empty dict
+    if the snapshot is missing (KPIs that depend on it gracefully degrade to 0)."""
+    if not SKU_CATEGORY_SNAPSHOT.exists():
+        return {}
+    df = pd.read_parquet(SKU_CATEGORY_SNAPSHOT)
+    return dict(zip(df["drug_id"].astype(int), df["category"].fillna("unknown").astype(str)))
 
 
 @st.cache_data(ttl=1800, show_spinner=False)

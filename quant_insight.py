@@ -44,6 +44,7 @@ KPI_DIRECTION = {
     "revenue": +1, "gm": +1, "gm_pct": +1, "aov": +1, "aom": +1, "acm": +1,
     "frequency": +1, "bill_count": +1, "unique_customers": +1,
     "total_quantity": +1, "total_units_pi": +1,
+    "pi_units_chronic": +1, "pi_units_acute": +1, "pi_units_therapy_cycle": +1,
     "items_per_bill": +1, "revenue_per_patient": +1,
     "repeat_patient_count": +1, "new_patient_count": +1,
     "repeat_rate": +1,
@@ -65,6 +66,9 @@ KPI_LABELS = {
     "frequency": "Frequency (bills/patient)",
     "total_quantity": "Total units",
     "total_units_pi": "Total units (price-↑ SKUs)",
+    "pi_units_chronic": "   ↳ chronic",
+    "pi_units_acute": "   ↳ acute",
+    "pi_units_therapy_cycle": "   ↳ therapy cycle",
     "items_per_bill": "Items per bill",
     "revenue_per_patient": "Revenue per patient (₹)",
     "repeat_patient_count": "Repeat patients (≥2 bills in window)",
@@ -81,7 +85,9 @@ KPI_LABELS = {
 # KPI groupings for the section dividers
 KPI_GROUPS = [
     ("Volume",       ["bill_count", "unique_customers", "total_quantity",
-                       "total_units_pi", "repeat_patient_count", "new_patient_count"]),
+                       "total_units_pi", "pi_units_chronic", "pi_units_acute",
+                       "pi_units_therapy_cycle",
+                       "repeat_patient_count", "new_patient_count"]),
     ("Revenue & Margin", ["revenue", "gm", "gm_pct"]),
     ("Per bill / per patient", ["aov", "aom", "acm", "items_per_bill",
                                  "revenue_per_patient", "frequency"]),
@@ -105,7 +111,9 @@ def fmt_value(kpi: str, v) -> str:
     if kpi in ("revenue", "gm", "aov", "aom", "acm", "revenue_per_patient"):
         return f"₹{v:,.0f}"
     if kpi in ("bill_count", "unique_customers", "total_quantity",
-                "total_units_pi", "repeat_patient_count", "new_patient_count"):
+                "total_units_pi", "pi_units_chronic", "pi_units_acute",
+                "pi_units_therapy_cycle",
+                "repeat_patient_count", "new_patient_count"):
         return f"{int(v):,}"
     return f"{v:.2f}"
 
@@ -315,6 +323,60 @@ with tab_summary:
             return styles
 
         st.dataframe(display.style.apply(styler, axis=1), width='stretch')
+
+    # Inline Cohort SKU pre/post — same as the dedicated 🎯 tab, contextual to Summary's cohort
+    with st.expander("📋 Cohort SKU pre/post — for the patients shown above", expanded=False):
+        st.caption(
+            "For the same patients that produced the Pilot Post numbers above (pilot stores, "
+            "post window, current bill-set filter), per-SKU pre vs post quantity in **pilot stores only**, "
+            "restricted to the 346 price-↑ SKUs."
+        )
+        # Reuse the dedicated tab's loaders (cached, cheap to re-call).
+        pilot_post_summary_df = pd.concat(
+            [load_store(s, post_from.isoformat(), post_to.isoformat()) for s in selected_pilots],
+            ignore_index=True,
+        )
+        pilot_pre_summary_df = pd.concat(
+            [load_store(s, pre_from.isoformat(), pre_to.isoformat()) for s in selected_pilots],
+            ignore_index=True,
+        )
+        def _apply_bill_filter_summary(df):
+            if df.empty or bill_filter == "all": return df
+            gross_all = df[df["bill_flag"] == "gross"]
+            pi_bill_ids = set(gross_all.loc[gross_all["drug_id"].astype("Int64").isin(sku_ids), "bill_id"].dropna().unique())
+            if bill_filter == "with_pi":
+                return df[df["bill_id"].isin(pi_bill_ids)]
+            all_ids = set(gross_all["bill_id"].dropna().unique())
+            return df[df["bill_id"].isin(all_ids - pi_bill_ids)]
+        cohort_post_df_sum = _apply_bill_filter_summary(pilot_post_summary_df)
+        cohort_ids_sum = set(
+            int(x) for x in cohort_post_df_sum.loc[cohort_post_df_sum["bill_flag"] == "gross", "patient_id"].dropna().unique()
+        )
+        st.markdown(f"**Cohort size:** {len(cohort_ids_sum):,} patients.")
+        if cohort_ids_sum:
+            inline_table = compute_cohort_sku_pre_post(
+                pilot_pre_summary_df, pilot_post_summary_df, cohort_ids_sum, sku_ids,
+            )
+            inline_table = inline_table[(inline_table["pre_qty"] > 0) | (inline_table["post_qty"] > 0)]
+            inline_table = inline_table.merge(
+                skus[["drug_id", "drug_name", "old_price", "new_price", "drug_type"]],
+                on="drug_id", how="left",
+            )
+            inline_table = inline_table[[
+                "drug_id", "drug_name", "drug_type", "old_price", "new_price",
+                "pre_qty", "post_qty", "delta_qty", "delta_qty_pct",
+                "pre_revenue", "post_revenue",
+            ]]
+            inline_table[["pre_qty", "post_qty", "delta_qty"]] = inline_table[
+                ["pre_qty", "post_qty", "delta_qty"]
+            ].astype(int)
+            inline_table["pre_revenue"] = inline_table["pre_revenue"].round(0)
+            inline_table["post_revenue"] = inline_table["post_revenue"].round(0)
+            inline_table["delta_qty_pct"] = inline_table["delta_qty_pct"].round(1)
+            st.dataframe(
+                inline_table, width='stretch', hide_index=True,
+                column_config={"drug_name": st.column_config.Column(pinned=True)},
+            )
 
     # Caveats for the All-Other column
     if store_totals is None:
