@@ -28,11 +28,15 @@ import psycopg2
 from data import (
     ASSORTMENT_GENERIC,
     ASSORTMENT_ETHICAL,
+    COHORT_HISTORY_SNAPSHOT,
+    COHORT_HISTORY_START,
     COUPON_PREFIX,
     GO_LIVE_DATE,
     PARTIAL_BILL_SNAPSHOT,
     PATIENTS_SNAPSHOT,
+    PILOT_STORES,
     QUANT_BASELINE_START,
+    QUANT_POST_START,
     SALES_SNAPSHOT,
     SKU_CATEGORY_SNAPSHOT,
     SNAPSHOTS_DIR,
@@ -300,21 +304,21 @@ def main() -> int:
     print()
 
     # 1) Line-level sales for the 14 pair-related stores.
-    print(f"[1/5] Line-level sales for {len(pair_related_stores)} pair-related stores…")
+    print(f"[1/6] Line-level sales for {len(pair_related_stores)} pair-related stores…")
     sales = fetch_sales_snapshot(pair_related_stores, date_from, date_to)
     sales.to_parquet(SALES_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
     print(f"  → {SALES_SNAPSHOT.name}: {len(sales):,} rows · {SALES_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print()
 
     # 2) Patients-first-seen for the 14 stores' patients.
-    print(f"[2/5] Patients first-seen…")
+    print(f"[2/6] Patients first-seen…")
     patients = build_patients_first_seen(pair_related_stores, date_from, date_to)
     patients.to_parquet(PATIENTS_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
     print(f"  → {PATIENTS_SNAPSHOT.name}: {len(patients):,} patients · {PATIENTS_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print()
 
     # 3) SKU category lookup (small file).
-    print(f"[3/5] SKU category lookup for price-↑ SKUs…")
+    print(f"[3/6] SKU category lookup for price-↑ SKUs…")
     skus = load_skus()
     sku_ids = set(skus["drug_id"].astype(int))
     sku_cat_df = fetch_sku_category(sku_ids)
@@ -325,7 +329,7 @@ def main() -> int:
     print()
 
     # 4) Per-store-per-day-per-bill-set totals for ALL chain stores.
-    print(f"[4/5] Per-store-per-day aggregates (ALL stores)…")
+    print(f"[4/6] Per-store-per-day aggregates (ALL stores)…")
     totals = build_store_totals(date_from, date_to, sku_ids, sku_category=sku_cat_lookup)
     totals = fill_new_patient_count(totals, patients)
     totals.to_parquet(STORE_TOTALS_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
@@ -334,7 +338,7 @@ def main() -> int:
     print()
 
     # 5) Partial-bill cohort: 4-month pre + post price-↑ SKU history (ALL stores).
-    print(f"[5/5] Partial-bill cohort history…")
+    print(f"[5/6] Partial-bill cohort history…")
     bundle = build_joined()
     pb_bills = bundle["bills"]
     pb_bills = pb_bills[pb_bills["is_amber_partial"].fillna(False)]
@@ -346,8 +350,86 @@ def main() -> int:
     print(f"  → {PARTIAL_BILL_SNAPSHOT.name}: {len(pb_history):,} rows · {PARTIAL_BILL_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print(f"     date range: {pb_history['day'].min()} → {pb_history['day'].max()}" if len(pb_history) else "     (empty)")
     print()
+
+    # 6) Chronic-cohort 6-month history (ALL chain stores).
+    print(f"[6/6] Chronic-cohort 6-month history…")
+    chronic_ids = {int(d) for d, c in sku_cat_lookup.items() if c == "chronic"}
+    print(f"  Chronic price-↑ SKUs: {len(chronic_ids)}")
+    # Cohort = patients who bought a chronic price-↑ SKU at a PILOT store
+    # during the post window (per the just-written sales.parquet).
+    cohort_patient_ids = _cohort_from_sales(sales, chronic_ids)
+    print(f"  Cohort (chronic-PI pilot-post patients): {len(cohort_patient_ids)}")
+    coh_history = _fetch_cohort_chronic_history(cohort_patient_ids, chronic_ids)
+    coh_history.to_parquet(COHORT_HISTORY_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
+    print(f"  → {COHORT_HISTORY_SNAPSHOT.name}: {len(coh_history):,} rows · {COHORT_HISTORY_SNAPSHOT.stat().st_size/1e6:.1f} MB")
+    if len(coh_history):
+        print(f"     date range: {coh_history['created_at'].min()} → {coh_history['created_at'].max()}")
+    print()
     print("Done.")
     return 0
+
+
+def _cohort_from_sales(sales: pd.DataFrame, chronic_ids: set[int]) -> list[int]:
+    """Identify patients with ≥1 gross bill at a pilot store containing a
+    chronic price-↑ SKU during the post window (QUANT_POST_START → today).
+    Uses the already-loaded sales.parquet DataFrame in memory."""
+    if sales.empty or not chronic_ids:
+        return []
+    pilot_set = set(PILOT_STORES)
+    post_start = QUANT_POST_START
+    today = dt.date.today()
+    df = sales.copy()
+    df["day"] = pd.to_datetime(df["created_at"], errors="coerce").dt.date
+    mask = (
+        (df["bill_flag"] == "gross")
+        & df["store_name"].isin(pilot_set)
+        & (df["day"] >= post_start)
+        & (df["day"] <= today)
+        & df["drug_id"].astype("Int64").isin(chronic_ids)
+    )
+    pids = df.loc[mask, "patient_id"].dropna().astype(int).unique().tolist()
+    return sorted(set(pids))
+
+
+def _fetch_cohort_chronic_history(patient_ids: list[int], chronic_ids: set[int]) -> pd.DataFrame:
+    """For the cohort, pull all gross-bill history of CHRONIC price-↑ SKUs
+    across ALL chain stores from COHORT_HISTORY_START through today."""
+    cols = ["patient_id", "drug_id", "drug_name", "store_name", "created_at",
+            "net_quantity", "revenue_value", "bill_flag"]
+    if not patient_ids or not chronic_ids:
+        return pd.DataFrame(columns=cols)
+    drug_tuple = tuple(int(x) for x in sorted(chronic_ids))
+    date_from = COHORT_HISTORY_START.isoformat()
+    date_to = dt.date.today().isoformat()
+    rows: list[tuple] = []
+    chunk = 1000
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for i in range(0, len(patient_ids), chunk):
+                batch = tuple(int(x) for x in patient_ids[i:i + chunk])
+                cur.execute(
+                    """
+                    SELECT "patient-id", "drug-id", "drug-name", "store-name",
+                           "created-at", "net-quantity", "revenue-value", "bill-flag"
+                    FROM "prod2-generico"."sales"
+                    WHERE "patient-id" IN %s
+                      AND "drug-id"   IN %s
+                      AND "created-at"::date BETWEEN %s AND %s
+                      AND "bill-flag" = 'gross'
+                    """,
+                    (batch, drug_tuple, date_from, date_to),
+                )
+                rows.extend(cur.fetchall())
+    df = pd.DataFrame(rows, columns=cols)
+    df["patient_id"] = pd.to_numeric(df["patient_id"], errors="coerce").astype("Int64")
+    df["drug_id"] = pd.to_numeric(df["drug_id"], errors="coerce").astype("Int64")
+    df["net_quantity"] = pd.to_numeric(df["net_quantity"], errors="coerce").fillna(0).astype("Float64")
+    df["revenue_value"] = pd.to_numeric(df["revenue_value"], errors="coerce").fillna(0).astype("Float64")
+    df["bill_flag"] = df["bill_flag"].astype(str)
+    df["drug_name"] = df["drug_name"].astype(str)
+    df["store_name"] = df["store_name"].astype(str)
+    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    return df
 
 
 def _fetch_partial_bill_history(patient_ids: list[int], sku_ids: set[int]) -> pd.DataFrame:

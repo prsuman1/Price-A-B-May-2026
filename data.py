@@ -46,6 +46,17 @@ STORE_TOTALS_SNAPSHOT = SNAPSHOTS_DIR / "store_totals.parquet"   # per-store-per
 PATIENTS_SNAPSHOT = SNAPSHOTS_DIR / "patients_first_seen.parquet"  # patient_id -> first_seen_date
 PARTIAL_BILL_SNAPSHOT = SNAPSHOTS_DIR / "partial_bill_history.parquet"  # partial-bill patients' price-↑ SKU history, all stores
 SKU_CATEGORY_SNAPSHOT = SNAPSHOTS_DIR / "sku_category.parquet"  # drug_id → category lookup for price-↑ SKUs
+COHORT_HISTORY_SNAPSHOT = SNAPSHOTS_DIR / "cohort_chronic_history.parquet"  # 6mo all-store history of chronic price-↑ SKUs for the pilot-post cohort
+
+COHORT_HISTORY_START = pd.Timestamp("2025-11-06").date()  # 6 months pre-go-live
+REFILL_GRACE_DAYS = 7  # grace before flagging a patient overdue
+SAME_REFILL_WINDOW_DAYS = 7  # purchases of the same drug within this many days
+                              # are treated as one refill event (avoids 1-2 day
+                              # "cycles" from same-refill top-ups skewing the
+                              # cycle estimate for chronic patients).
+MIN_PLAUSIBLE_CYCLE_DAYS = 7  # cycle estimates shorter than this are flagged
+                               # as no_estimate (chronic refills can't really be
+                               # weekly or shorter — the data is noise).
 
 # Known surveyor-typo prefixes — applied after Z-strip + uppercase in serial normalization.
 PREFIX_FIXES = {"KEWT": "KRWT"}
@@ -993,3 +1004,282 @@ def compute_cohort_sku_pre_post(
     cols = ["drug_id", "pre_qty", "post_qty", "delta_qty",
             "delta_qty_pct", "pre_revenue", "post_revenue"]
     return out[cols].sort_values("post_qty", ascending=False)
+
+
+# ============================================================================
+# Phase 12 — Chronic-cohort deep dive (Refill Cycle + Bill Progression)
+# ============================================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_cohort_history_snapshot() -> pd.DataFrame | None:
+    """6-month all-chain history of chronic price-↑ SKUs for the pilot-post cohort.
+    Built by `refresh_snapshots.py` step [6/6]. Returns None if missing."""
+    if not COHORT_HISTORY_SNAPSHOT.exists():
+        return None
+    df = pd.read_parquet(COHORT_HISTORY_SNAPSHOT)
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    return df
+
+
+def chronic_pi_drug_ids() -> set[int]:
+    """Drug IDs in the price-↑ universe whose category is `chronic`.
+    Joins the SKU CSV against `sku_category.parquet`. Empty set if either is missing."""
+    cat = _load_sku_category()
+    if not cat:
+        return set()
+    skus = load_skus()
+    sku_universe = set(int(x) for x in skus["drug_id"].astype(int))
+    return {d for d in sku_universe if cat.get(int(d), "") == "chronic"}
+
+
+def compute_refill_cycle(
+    hist_df: pd.DataFrame,
+    post_start,
+    today,
+) -> pd.DataFrame:
+    """Per (patient_id, drug_id), derive refill cycle and flag overdue.
+
+    Inputs:
+      hist_df    — cohort-history rows (one row per gross-bill line), with
+                   columns: patient_id, drug_id, drug_name, store_name,
+                   created_at, net_quantity, bill_flag.
+      post_start — date marking start of post window (anything before is `pre`).
+      today      — date used to compute days_overdue.
+
+    Output columns:
+      patient_id, drug_id, drug_name, n_pre_purchases, last_pre_date,
+      last_pre_qty, last_pre_store, cycle_days, expected_refill_date,
+      any_post_purchase, days_overdue, status
+        status ∈ {refilled, on_time, overdue, no_estimate}
+    """
+    if hist_df is None or hist_df.empty:
+        return pd.DataFrame(columns=[
+            "patient_id", "drug_id", "drug_name", "n_pre_purchases",
+            "last_pre_date", "last_pre_qty", "last_pre_store",
+            "cycle_days", "expected_refill_date",
+            "any_post_purchase", "days_overdue", "status",
+        ])
+
+    post_start = pd.Timestamp(post_start).date()
+    today = pd.Timestamp(today).date()
+
+    df = hist_df[hist_df["bill_flag"].astype(str).str.lower() == "gross"].copy()
+    df["day"] = pd.to_datetime(df["created_at"]).dt.date
+    df["drug_id"] = df["drug_id"].astype("Int64")
+    df["patient_id"] = df["patient_id"].astype("Int64")
+
+    # Per (patient × drug × day): sum qty (handle multiple bills same day as one refill event).
+    daily = (
+        df.groupby(["patient_id", "drug_id", "day"], dropna=True)
+        .agg(qty=("net_quantity", "sum"),
+             store_name=("store_name", "first"),
+             drug_name=("drug_name", "first"))
+        .reset_index()
+        .sort_values(["patient_id", "drug_id", "day"])
+    )
+
+    # Collapse consecutive purchases of the same drug within SAME_REFILL_WINDOW_DAYS
+    # into a single refill event (anchored to the FIRST purchase, qty summed).
+    # This prevents spurious 1-2 day "cycles" from same-refill top-ups (e.g., a
+    # patient buying half a strip today and coming back tomorrow for the rest).
+    from datetime import timedelta as _td
+    collapsed_rows: list[dict] = []
+    for (pid, did), g in daily.groupby(["patient_id", "drug_id"], dropna=True):
+        events: list[dict] = []
+        for _, r in g.sort_values("day").iterrows():
+            if events and (r["day"] - events[-1]["day"]).days <= SAME_REFILL_WINDOW_DAYS:
+                events[-1]["qty"] = events[-1]["qty"] + float(r["qty"])
+            else:
+                events.append({"patient_id": pid, "drug_id": did,
+                                "day": r["day"], "qty": float(r["qty"]),
+                                "store_name": r["store_name"],
+                                "drug_name": r["drug_name"]})
+        collapsed_rows.extend(events)
+    daily = pd.DataFrame(collapsed_rows).sort_values(["patient_id", "drug_id", "day"])
+
+    out_rows: list[dict] = []
+    for (pid, did), g in daily.groupby(["patient_id", "drug_id"], dropna=True):
+        if pd.isna(pid) or pd.isna(did):
+            continue
+        pre = g[g["day"] < post_start]
+        post = g[g["day"] >= post_start]
+        n_pre = len(pre)
+        drug_name = g["drug_name"].iloc[-1] if len(g) else ""
+
+        if n_pre == 0:
+            # Patient bought this drug only post-go-live — irrelevant to refill-overdue.
+            continue
+
+        last_pre = pre.iloc[-1]
+        last_pre_date = last_pre["day"]
+        last_pre_qty = float(last_pre["qty"])
+        last_pre_store = str(last_pre["store_name"])
+
+        if n_pre >= 2:
+            gaps = (pre["day"].diff().dt.days if hasattr(pre["day"], "dt")
+                    else pd.Series([(b - a).days for a, b in zip(pre["day"][:-1], pre["day"][1:])]))
+            # The lambda-safe way: compute via list.
+            sorted_days = list(pre["day"])
+            gap_list = [(sorted_days[i] - sorted_days[i - 1]).days for i in range(1, len(sorted_days))]
+            if len(gap_list) >= 2:
+                cycle_days = float(pd.Series(gap_list).median())
+            else:
+                cycle_days = float(pd.Series(gap_list).mean())
+        else:
+            cycle_days = float("nan")
+
+        if pd.isna(cycle_days) or cycle_days < MIN_PLAUSIBLE_CYCLE_DAYS:
+            status = "no_estimate"
+            expected = pd.NaT
+            days_overdue = None
+            any_post = not post.empty
+        else:
+            from datetime import timedelta
+            expected = last_pre_date + timedelta(days=int(round(cycle_days)))
+            any_post = not post.empty
+            days_overdue = (today - expected).days
+            if any_post:
+                status = "refilled"
+            elif days_overdue <= REFILL_GRACE_DAYS:
+                status = "on_time"
+            else:
+                status = "overdue"
+
+        out_rows.append({
+            "patient_id": int(pid),
+            "drug_id": int(did),
+            "drug_name": drug_name,
+            "n_pre_purchases": int(n_pre),
+            "last_pre_date": last_pre_date,
+            "last_pre_qty": last_pre_qty,
+            "last_pre_store": last_pre_store,
+            "cycle_days": cycle_days if not pd.isna(cycle_days) else None,
+            "expected_refill_date": expected if pd.notna(expected) else None,
+            "any_post_purchase": bool(any_post),
+            "days_overdue": days_overdue,
+            "status": status,
+        })
+
+    return pd.DataFrame(out_rows)
+
+
+def compute_bill_progression(
+    hist_df: pd.DataFrame,
+    post_start,
+    post_end,
+    chronic_pi_ids: set[int],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compare each patient's latest post-window bill against their previous
+    1st / 2nd / 3rd bills (anywhere in chain). Identify chronic price-↑ SKUs
+    they used to buy but didn't this time.
+
+    Returns:
+      per_patient — one row per patient with comparisons + dropped drug_id lists.
+      per_drug    — chronic price-↑ drug rollup: how many patients dropped each.
+    """
+    cols_pp = [
+        "patient_id", "latest_bill_id", "latest_bill_date", "latest_store",
+        "n_chronic_pi_latest",
+        "prev1_date", "prev1_store", "dropped_vs_prev1", "dropped_vs_prev1_drugs",
+        "prev2_date", "prev2_store", "dropped_vs_prev2", "dropped_vs_prev2_drugs",
+        "prev3_date", "prev3_store", "dropped_vs_prev3", "dropped_vs_prev3_drugs",
+    ]
+    if hist_df is None or hist_df.empty or not chronic_pi_ids:
+        return pd.DataFrame(columns=cols_pp), pd.DataFrame(columns=["drug_id", "drug_name", "vs_prev1", "vs_prev2", "vs_prev3", "total_dropped"])
+
+    post_start = pd.Timestamp(post_start).date()
+    post_end = pd.Timestamp(post_end).date()
+    chronic_pi_ids = {int(x) for x in chronic_pi_ids}
+
+    df = hist_df[hist_df["bill_flag"].astype(str).str.lower() == "gross"].copy()
+    df["day"] = pd.to_datetime(df["created_at"]).dt.date
+    df["drug_id"] = df["drug_id"].astype("Int64")
+    df["patient_id"] = df["patient_id"].astype("Int64")
+    # NB: cohort-history snapshot doesn't currently carry bill_id (kept lean),
+    # so we use (patient, store, day) as the bill key — good enough for cohort
+    # rollups where same-day same-store rows belong to the same visit.
+    df["bill_key"] = df.apply(
+        lambda r: (int(r["patient_id"]) if pd.notna(r["patient_id"]) else -1,
+                   str(r["store_name"]),
+                   r["day"]),
+        axis=1,
+    )
+
+    drug_name_lookup = (
+        df.dropna(subset=["drug_id"])
+        .drop_duplicates("drug_id")
+        .set_index("drug_id")["drug_name"]
+        .astype(str)
+        .to_dict()
+    )
+
+    pp_rows: list[dict] = []
+    per_drug_counter = {k: {"vs_prev1": 0, "vs_prev2": 0, "vs_prev3": 0} for k in chronic_pi_ids}
+
+    # Build per-bill aggregates
+    bill_df = (
+        df.dropna(subset=["patient_id"])
+        .groupby("bill_key")
+        .agg(patient_id=("patient_id", "first"),
+             store_name=("store_name", "first"),
+             day=("day", "first"),
+             drug_ids=("drug_id", lambda s: set(int(x) for x in s if pd.notna(x))))
+        .reset_index()
+    )
+
+    for pid, pg in bill_df.groupby("patient_id"):
+        pg = pg.sort_values("day", ascending=False).reset_index(drop=True)
+        latest_idx = None
+        for i, r in pg.iterrows():
+            if post_start <= r["day"] <= post_end:
+                latest_idx = i
+                break
+        if latest_idx is None:
+            continue
+
+        latest = pg.iloc[latest_idx]
+        latest_drugs = set(int(x) for x in latest["drug_ids"]) & chronic_pi_ids
+        prev_bills = pg.iloc[latest_idx + 1: latest_idx + 4].reset_index(drop=True)
+
+        row: dict = {
+            "patient_id": int(pid),
+            "latest_bill_id": f"{latest['store_name']}@{latest['day']}",
+            "latest_bill_date": latest["day"],
+            "latest_store": str(latest["store_name"]),
+            "n_chronic_pi_latest": len(latest_drugs),
+        }
+        for n in (1, 2, 3):
+            if n - 1 < len(prev_bills):
+                pb = prev_bills.iloc[n - 1]
+                pb_drugs = set(int(x) for x in pb["drug_ids"]) & chronic_pi_ids
+                dropped = pb_drugs - latest_drugs
+                row[f"prev{n}_date"] = pb["day"]
+                row[f"prev{n}_store"] = str(pb["store_name"])
+                row[f"dropped_vs_prev{n}"] = len(dropped)
+                row[f"dropped_vs_prev{n}_drugs"] = sorted(dropped)
+                for d in dropped:
+                    per_drug_counter[d][f"vs_prev{n}"] += 1
+            else:
+                row[f"prev{n}_date"] = None
+                row[f"prev{n}_store"] = None
+                row[f"dropped_vs_prev{n}"] = 0
+                row[f"dropped_vs_prev{n}_drugs"] = []
+        pp_rows.append(row)
+
+    per_patient = pd.DataFrame(pp_rows, columns=cols_pp)
+
+    per_drug_rows = []
+    for did, counts in per_drug_counter.items():
+        if counts["vs_prev1"] + counts["vs_prev2"] + counts["vs_prev3"] == 0:
+            continue
+        per_drug_rows.append({
+            "drug_id": did,
+            "drug_name": drug_name_lookup.get(did, ""),
+            "vs_prev1": counts["vs_prev1"],
+            "vs_prev2": counts["vs_prev2"],
+            "vs_prev3": counts["vs_prev3"],
+            "total_dropped": counts["vs_prev1"] + counts["vs_prev2"] + counts["vs_prev3"],
+        })
+    per_drug = pd.DataFrame(per_drug_rows).sort_values("total_dropped", ascending=False)
+    return per_patient, per_drug

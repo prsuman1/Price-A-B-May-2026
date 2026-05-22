@@ -325,8 +325,51 @@ def build_context_summary() -> str:
         _summarise_survey(bundle),
         "",
         _summarise_quant(sku_ids, patients),
+        "",
+        _summarise_chronic_cohort(),
     ]
     return "\n".join(parts)
+
+
+def _summarise_chronic_cohort() -> str:
+    """Refill-cycle + bill-progression headline numbers for the chronic-cohort
+    pages (Phase 12). Reads from `cohort_chronic_history.parquet`."""
+    from datetime import date
+    from data import (
+        QUANT_POST_START, QUANT_POST_END,
+        _load_cohort_history_snapshot, chronic_pi_drug_ids,
+        compute_refill_cycle, compute_bill_progression,
+    )
+    h = _load_cohort_history_snapshot()
+    if h is None or h.empty:
+        return "## Chronic-cohort deep-dive\n_Snapshot unavailable._"
+    chronic = chronic_pi_drug_ids()
+    if not chronic:
+        return "## Chronic-cohort deep-dive\n_SKU category lookup unavailable._"
+    h = h[h["bill_flag"].astype(str).str.lower() == "gross"].copy()
+    h["day"] = pd.to_datetime(h["created_at"]).dt.date
+    cohort_mask = (
+        (h["day"] >= QUANT_POST_START)
+        & (h["day"] <= QUANT_POST_END)
+        & h["drug_id"].astype("Int64").isin(chronic)
+    )
+    cohort = set(int(x) for x in h.loc[cohort_mask, "patient_id"].dropna().unique())
+    if not cohort:
+        return "## Chronic-cohort deep-dive\n_Empty cohort._"
+    sub = h[h["patient_id"].astype("Int64").isin(cohort)]
+    rc = compute_refill_cycle(sub, QUANT_POST_START, date.today())
+    pp, _ = compute_bill_progression(sub, QUANT_POST_START, QUANT_POST_END, chronic)
+    n_overdue_patients = rc.loc[rc["status"] == "overdue", "patient_id"].astype(int).nunique()
+    pct_overdue = (n_overdue_patients / len(cohort) * 100) if cohort else 0
+    pct_dropped = ((pp["dropped_vs_prev1"] > 0).mean() * 100) if not pp.empty else 0
+    return (
+        "## Chronic-cohort deep-dive (Refill Cycle + Bill Progression pages)\n"
+        f"- Cohort: {len(cohort):,} patients who bought a chronic price-↑ SKU at a pilot store post-go-live.\n"
+        f"- {n_overdue_patients:,} patients ({pct_overdue:.1f}%) are overdue for ≥1 chronic refill "
+        f"(>7d past expected refill date, no purchase recorded at any chain store).\n"
+        f"- {pct_dropped:.1f}% of cohort patients dropped ≥1 chronic price-↑ SKU from their latest bill vs their previous bill.\n"
+        f"- 240 chronic price-↑ SKUs in scope; 6-month history window in the snapshot."
+    )
 
 
 # ---------------------------------------------------------------------------
