@@ -81,8 +81,8 @@ PAIRED_NON_PILOT_STORES = tuple(p["non_pilot"] for p in STORE_PAIRS)
 QUANT_PRE_START = pd.Timestamp("2026-04-20").date()
 QUANT_PRE_END = pd.Timestamp("2026-05-05").date()
 QUANT_POST_START = pd.Timestamp("2026-05-06").date()
-QUANT_POST_END = pd.Timestamp("2026-05-21").date()
-QUANT_BASELINE_START = pd.Timestamp("2026-02-06").date()
+QUANT_POST_END = pd.Timestamp("2026-05-25").date()
+QUANT_BASELINE_START = pd.Timestamp("2026-01-01").date()
 QUANT_BASELINE_END = pd.Timestamp("2026-04-19").date()
 ASSORTMENT_GENERIC = (3, 4)   # Generic + Generic-Speciality
 ASSORTMENT_ETHICAL = (1, 2)   # Ethical + Ethical-Speciality
@@ -1004,6 +1004,78 @@ def compute_cohort_sku_pre_post(
     cols = ["drug_id", "pre_qty", "post_qty", "delta_qty",
             "delta_qty_pct", "pre_revenue", "post_revenue"]
     return out[cols].sort_values("post_qty", ascending=False)
+
+
+def compute_cohort_monthly_history(
+    sales_df: pd.DataFrame,
+    cohort_ids: set[int],
+    sku_ids: set[int],
+    cat_lookup: dict[int, str],
+    pilot_stores: tuple[str, ...],
+) -> pd.DataFrame:
+    """Per calendar month, KPI breakdown for the cohort patients' activity in
+    pilot stores. Pure compute; caller passes in the already-loaded snapshot.
+
+    Returns one row per calendar month present in the data, with columns:
+      month, bills, patients, frequency,
+      total_units, total_skus,
+      total_units_chronic, total_units_acute,
+      total_skus_chronic, total_skus_acute,
+      price_hiked_units, price_hiked_skus,
+      price_hiked_units_chronic, price_hiked_units_acute,
+      price_hiked_skus_chronic, price_hiked_skus_acute,
+    """
+    empty_cols = [
+        "month", "bills", "patients", "frequency",
+        "total_units", "total_skus",
+        "total_units_chronic", "total_units_acute",
+        "total_skus_chronic", "total_skus_acute",
+        "price_hiked_units", "price_hiked_skus",
+        "price_hiked_units_chronic", "price_hiked_units_acute",
+        "price_hiked_skus_chronic", "price_hiked_skus_acute",
+    ]
+    if sales_df is None or sales_df.empty or not cohort_ids:
+        return pd.DataFrame(columns=empty_cols)
+
+    df = sales_df[sales_df["bill_flag"] == "gross"].copy()
+    if pilot_stores:
+        df = df[df["store_name"].isin(pilot_stores)]
+    df = df[df["patient_id"].astype("Int64").isin(cohort_ids)]
+    if df.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    df["month"] = pd.to_datetime(df["created_at"]).dt.to_period("M").astype(str)
+    df["_cat"] = df["drug_id"].map(lambda d: cat_lookup.get(int(d), "unknown") if pd.notna(d) else "unknown")
+    df["_is_pi"] = df["drug_id"].astype("Int64").isin(sku_ids)
+
+    def per_month(g: pd.DataFrame) -> pd.Series:
+        bills = int(g["bill_id"].nunique())
+        patients = int(g["patient_id"].dropna().nunique())
+        pi = g[g["_is_pi"]]
+        chronic = g[g["_cat"] == "chronic"]
+        acute = g[g["_cat"] == "acute"]
+        pi_chronic = pi[pi["_cat"] == "chronic"]
+        pi_acute = pi[pi["_cat"] == "acute"]
+        return pd.Series({
+            "bills": bills,
+            "patients": patients,
+            "frequency": (bills / patients) if patients else 0.0,
+            "total_units": float(g["net_quantity"].sum()),
+            "total_skus": int(g["drug_id"].dropna().nunique()),
+            "total_units_chronic": float(chronic["net_quantity"].sum()),
+            "total_units_acute": float(acute["net_quantity"].sum()),
+            "total_skus_chronic": int(chronic["drug_id"].dropna().nunique()),
+            "total_skus_acute": int(acute["drug_id"].dropna().nunique()),
+            "price_hiked_units": float(pi["net_quantity"].sum()),
+            "price_hiked_skus": int(pi["drug_id"].dropna().nunique()),
+            "price_hiked_units_chronic": float(pi_chronic["net_quantity"].sum()),
+            "price_hiked_units_acute": float(pi_acute["net_quantity"].sum()),
+            "price_hiked_skus_chronic": int(pi_chronic["drug_id"].dropna().nunique()),
+            "price_hiked_skus_acute": int(pi_acute["drug_id"].dropna().nunique()),
+        })
+
+    out = df.groupby("month", sort=True).apply(per_month, include_groups=False).reset_index()
+    return out[empty_cols]
 
 
 # ============================================================================

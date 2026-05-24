@@ -26,9 +26,11 @@ from data import (
     STORE_PAIRS,
     _load_patients_snapshot,
     _load_sales_snapshot,
+    _load_sku_category,
     _load_store_totals_snapshot,
     aggregate_totals,
     build_pair_table,
+    compute_cohort_monthly_history,
     compute_cohort_sku_pre_post,
     compute_elasticity,
     compute_kpis,
@@ -36,6 +38,26 @@ from data import (
     fetch_quant_sales,
     load_skus,
 )
+
+
+def derive_cohort_ids(pilot_post_df: pd.DataFrame, sku_ids_set: set, filt: str) -> set[int]:
+    """Patient ids on pilot-post gross bills under the given bill_filter."""
+    if pilot_post_df.empty:
+        return set()
+    gross_all = pilot_post_df[pilot_post_df["bill_flag"] == "gross"]
+    if filt == "all":
+        cohort_src = gross_all
+    else:
+        pi_bill_ids = set(
+            gross_all.loc[gross_all["drug_id"].astype("Int64").isin(sku_ids_set), "bill_id"]
+            .dropna().unique()
+        )
+        if filt == "with_pi":
+            cohort_src = gross_all[gross_all["bill_id"].isin(pi_bill_ids)]
+        else:  # without_pi
+            all_ids = set(gross_all["bill_id"].dropna().unique())
+            cohort_src = gross_all[gross_all["bill_id"].isin(all_ids - pi_bill_ids)]
+    return set(int(x) for x in cohort_src["patient_id"].dropna().unique())
 
 # ----- KPI catalogue ----------------------------------------------------------
 
@@ -324,33 +346,79 @@ with tab_summary:
 
         st.dataframe(display.style.apply(styler, axis=1), width='stretch')
 
+    # Shared cohort derivation (used by monthly history + the SKU pre/post expander).
+    pilot_post_summary_df = pd.concat(
+        [load_store(s, post_from.isoformat(), post_to.isoformat()) for s in selected_pilots],
+        ignore_index=True,
+    )
+    pilot_pre_summary_df = pd.concat(
+        [load_store(s, pre_from.isoformat(), pre_to.isoformat()) for s in selected_pilots],
+        ignore_index=True,
+    )
+    cohort_ids_sum = derive_cohort_ids(pilot_post_summary_df, sku_ids, bill_filter)
+
+    # ----- Cohort monthly history -------------------------------------------
+    st.markdown("---")
+    st.markdown("### 📅 Cohort monthly history")
+    st.caption(
+        f"Same cohort (**{len(cohort_ids_sum):,} patients** in Pilot Post window, "
+        f"`{bill_filter}` filter). Their bills across **pilot stores only**, grouped by "
+        "calendar month back to January 2026. Cohort changes when you move the date range."
+    )
+    if not cohort_ids_sum:
+        st.info("Cohort is empty for the current filters.")
+    else:
+        snap = _load_sales_snapshot()
+        if snap is None:
+            st.warning("`data_snapshots/sales.parquet` missing — refresh snapshots to populate.")
+        else:
+            cat_lookup = _load_sku_category()
+            monthly = compute_cohort_monthly_history(
+                snap, cohort_ids_sum, sku_ids, cat_lookup, tuple(selected_pilots),
+            )
+            if monthly.empty:
+                st.info("No historical activity found for this cohort in the snapshot.")
+            else:
+                display_monthly = monthly.copy()
+                display_monthly["frequency"] = display_monthly["frequency"].round(2)
+                int_cols = [c for c in display_monthly.columns if c not in ("month", "frequency")]
+                display_monthly[int_cols] = display_monthly[int_cols].astype(int)
+                st.dataframe(
+                    display_monthly,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "month": st.column_config.Column("Month", pinned=True),
+                        "bills": st.column_config.NumberColumn("Bills", format="%d"),
+                        "patients": st.column_config.NumberColumn("Patients", format="%d"),
+                        "frequency": st.column_config.NumberColumn("Frequency", format="%.2f"),
+                        "total_units": st.column_config.NumberColumn("Total Units", format="%d"),
+                        "total_skus": st.column_config.NumberColumn("Total SKU", format="%d"),
+                        "total_units_chronic": st.column_config.NumberColumn("Total Units Chronic", format="%d"),
+                        "total_units_acute": st.column_config.NumberColumn("Total Units Acute", format="%d"),
+                        "total_skus_chronic": st.column_config.NumberColumn("Total SKU Chronic", format="%d"),
+                        "total_skus_acute": st.column_config.NumberColumn("Total SKU Acute", format="%d"),
+                        "price_hiked_units": st.column_config.NumberColumn("Price Hiked Units", format="%d"),
+                        "price_hiked_skus": st.column_config.NumberColumn("Price Hiked SKU", format="%d"),
+                        "price_hiked_units_chronic": st.column_config.NumberColumn("PH Units Chronic", format="%d"),
+                        "price_hiked_units_acute": st.column_config.NumberColumn("PH Units Acute", format="%d"),
+                        "price_hiked_skus_chronic": st.column_config.NumberColumn("PH SKU Chronic", format="%d"),
+                        "price_hiked_skus_acute": st.column_config.NumberColumn("PH SKU Acute", format="%d"),
+                    },
+                )
+                st.download_button(
+                    "📥 Download cohort monthly history",
+                    data=monthly.to_csv(index=False).encode("utf-8"),
+                    file_name="cohort_monthly_history.csv",
+                    mime="text/csv",
+                )
+
     # Inline Cohort SKU pre/post — same as the dedicated 🎯 tab, contextual to Summary's cohort
     with st.expander("📋 Cohort SKU pre/post — for the patients shown above", expanded=False):
         st.caption(
             "For the same patients that produced the Pilot Post numbers above (pilot stores, "
             "post window, current bill-set filter), per-SKU pre vs post quantity in **pilot stores only**, "
             "restricted to the 346 price-↑ SKUs."
-        )
-        # Reuse the dedicated tab's loaders (cached, cheap to re-call).
-        pilot_post_summary_df = pd.concat(
-            [load_store(s, post_from.isoformat(), post_to.isoformat()) for s in selected_pilots],
-            ignore_index=True,
-        )
-        pilot_pre_summary_df = pd.concat(
-            [load_store(s, pre_from.isoformat(), pre_to.isoformat()) for s in selected_pilots],
-            ignore_index=True,
-        )
-        def _apply_bill_filter_summary(df):
-            if df.empty or bill_filter == "all": return df
-            gross_all = df[df["bill_flag"] == "gross"]
-            pi_bill_ids = set(gross_all.loc[gross_all["drug_id"].astype("Int64").isin(sku_ids), "bill_id"].dropna().unique())
-            if bill_filter == "with_pi":
-                return df[df["bill_id"].isin(pi_bill_ids)]
-            all_ids = set(gross_all["bill_id"].dropna().unique())
-            return df[df["bill_id"].isin(all_ids - pi_bill_ids)]
-        cohort_post_df_sum = _apply_bill_filter_summary(pilot_post_summary_df)
-        cohort_ids_sum = set(
-            int(x) for x in cohort_post_df_sum.loc[cohort_post_df_sum["bill_flag"] == "gross", "patient_id"].dropna().unique()
         )
         st.markdown(f"**Cohort size:** {len(cohort_ids_sum):,} patients.")
         if cohort_ids_sum:

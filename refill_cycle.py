@@ -136,8 +136,10 @@ patients_overdue = set(metrics.loc[metrics["status"] == "overdue", "patient_id"]
 pct_overdue = len(patients_overdue) / n_patients * 100 if n_patients else 0
 pct_refilled = (metrics["status"] == "refilled").mean() * 100 if n_pairs else 0
 
+units_at_risk = float(metrics.loc[metrics["status"] == "overdue", "last_pre_qty"].sum())
+
 st.markdown("---")
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("👥 Cohort patients", f"{n_patients:,}")
 k2.metric("💊 Patient-drug pairs", f"{n_pairs:,}",
           help="Number of (patient × chronic price-↑ SKU) pairs with ≥1 historical purchase.")
@@ -148,6 +150,8 @@ k4.metric("⚠️ Patients overdue (1+ drug)",
           f"{len(patients_overdue):,}",
           f"{pct_overdue:.1f}% of cohort",
           delta_color="inverse")
+k5.metric("📦 Units at risk", f"{int(units_at_risk):,}",
+          help="Total units of chronic medication unfulfilled — Σ of the last-pre-window refill size across all overdue patient×drug pairs.")
 
 
 # ----- Section A — Funnel by status ---------------------------------------
@@ -203,6 +207,7 @@ else:
         overdue.groupby("patient_id")
         .agg(
             n_overdue_drugs=("drug_id", "nunique"),
+            units_at_risk=("last_pre_qty", "sum"),
             max_days_overdue=("days_overdue", "max"),
             avg_days_overdue=("days_overdue", "mean"),
             last_pre_date=("last_pre_date", "max"),
@@ -215,6 +220,7 @@ else:
     )
     by_patient["avg_days_overdue"] = by_patient["avg_days_overdue"].round(0).astype(int)
     by_patient["max_days_overdue"] = by_patient["max_days_overdue"].astype(int)
+    by_patient["units_at_risk"] = by_patient["units_at_risk"].round(0).astype(int)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Patients overdue", f"{len(by_patient):,}")
@@ -228,6 +234,8 @@ else:
         column_config={
             "patient_id": st.column_config.NumberColumn("Patient ID", format="%d", pinned=True),
             "n_overdue_drugs": st.column_config.NumberColumn("# Overdue drugs"),
+            "units_at_risk": st.column_config.NumberColumn("Units at risk", format="%d",
+                help="Σ of last pre-window refill size across all overdue drugs for this patient."),
             "max_days_overdue": st.column_config.NumberColumn("Max days overdue"),
             "avg_days_overdue": st.column_config.NumberColumn("Avg days overdue"),
             "most_overdue_drug": "Most-overdue drug",
@@ -294,13 +302,20 @@ drug_summary = (
         cohort=("patient_id", "nunique"),
         overdue=("status", lambda s: (s == "overdue").sum()),
         refilled=("status", lambda s: (s == "refilled").sum()),
+        units_at_risk=("last_pre_qty", lambda s: s[metrics.loc[s.index, "status"] == "overdue"].sum()),
     )
     .reset_index()
 )
 drug_summary["overdue_rate"] = drug_summary["overdue"] / drug_summary["cohort"] * 100
+drug_summary["units_at_risk"] = drug_summary["units_at_risk"].round(0).astype(int)
 top_drugs = (
     drug_summary[drug_summary["cohort"] >= 5]
     .sort_values("overdue", ascending=False)
+    .head(20)
+)
+top_drugs_by_units = (
+    drug_summary[drug_summary["units_at_risk"] > 0]
+    .sort_values("units_at_risk", ascending=False)
     .head(20)
 )
 
@@ -327,6 +342,30 @@ else:
         "Top 20 chronic price-↑ SKUs by absolute overdue-patient count "
         "(filtered to drugs with ≥5 patients in the cohort, so percentages are meaningful)."
     )
+
+    if not top_drugs_by_units.empty:
+        st.markdown("**Units at risk per drug** (top 20 by total unfulfilled units)")
+        units_bar = (
+            alt.Chart(top_drugs_by_units)
+            .mark_bar(color="#8E44AD")
+            .encode(
+                x=alt.X("units_at_risk:Q", title="Units at risk (Σ last_pre_qty for overdue rows)"),
+                y=alt.Y("drug_name:N", sort="-x", title=None),
+                tooltip=[
+                    "drug_name",
+                    alt.Tooltip("cohort", title="Cohort patients (this drug)"),
+                    alt.Tooltip("overdue", title="Overdue patients"),
+                    alt.Tooltip("units_at_risk", title="Units at risk"),
+                ],
+            )
+            .properties(height=max(220, 22 * len(top_drugs_by_units)))
+        )
+        st.altair_chart(units_bar, width="stretch")
+        st.caption(
+            "Same overdue rows, ranked by **units** instead of patient count. "
+            "Useful when a single drug ships in larger packs (e.g. 30-day vs 10-day strips) — "
+            "high-units-per-pack drugs may matter more for revenue-at-risk even at lower patient counts."
+        )
 
 
 # ----- Section E — Cycle estimate quality ---------------------------------
