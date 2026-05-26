@@ -448,8 +448,8 @@ with tab_summary:
                     st.info("No patients were active in every calendar month of the window.")
                 else:
                     st.caption(
-                        f"**{len(regulars_ids):,} patients** had ≥1 bill at any chain store in "
-                        f"**every** calendar month of the window ({expected_months} months total). "
+                        f"**{len(regulars_ids):,} patients** had ≥1 bill at a pilot or paired-control store "
+                        f"in **every** calendar month of the window ({expected_months} months total). "
                         "KPIs measured at pilot stores only — same scope as 'All cohort', so values are directly comparable."
                     )
                     monthly_reg = compute_cohort_monthly_history(
