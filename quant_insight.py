@@ -35,6 +35,7 @@ from data import (
     compute_elasticity,
     compute_kpis,
     compute_repeat_churn,
+    fetch_patient_monthly_activity,
     fetch_quant_sales,
     load_skus,
 )
@@ -361,10 +362,47 @@ with tab_summary:
     st.markdown("---")
     st.markdown("### 📅 Cohort monthly history")
     st.caption(
-        f"Same cohort (**{len(cohort_ids_sum):,} patients** in Pilot Post window, "
-        f"`{bill_filter}` filter). Their bills across **pilot stores only**, grouped by "
-        "calendar month back to January 2026. Cohort changes when you move the date range."
+        f"Cohort = patients in the Pilot Post window under `{bill_filter}` filter. "
+        "Their bills across **pilot stores only**, grouped by calendar month back to January 2026. "
+        "Cohort changes when you move the date range."
     )
+
+    def _render_monthly_table(df_in: pd.DataFrame, filename: str, dl_key: str) -> None:
+        display_monthly = df_in.copy()
+        display_monthly["frequency"] = display_monthly["frequency"].round(2)
+        int_cols = [c for c in display_monthly.columns if c not in ("month", "frequency")]
+        display_monthly[int_cols] = display_monthly[int_cols].astype(int)
+        st.dataframe(
+            display_monthly,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "month": st.column_config.Column("Month", pinned=True),
+                "bills": st.column_config.NumberColumn("Bills", format="%d"),
+                "patients": st.column_config.NumberColumn("Patients", format="%d"),
+                "frequency": st.column_config.NumberColumn("Frequency", format="%.2f"),
+                "total_units": st.column_config.NumberColumn("Total Units", format="%d"),
+                "total_skus": st.column_config.NumberColumn("Total SKU", format="%d"),
+                "total_units_chronic": st.column_config.NumberColumn("Total Units Chronic", format="%d"),
+                "total_units_acute": st.column_config.NumberColumn("Total Units Acute", format="%d"),
+                "total_skus_chronic": st.column_config.NumberColumn("Total SKU Chronic", format="%d"),
+                "total_skus_acute": st.column_config.NumberColumn("Total SKU Acute", format="%d"),
+                "price_hiked_units": st.column_config.NumberColumn("Price Hiked Units", format="%d"),
+                "price_hiked_skus": st.column_config.NumberColumn("Price Hiked SKU", format="%d"),
+                "price_hiked_units_chronic": st.column_config.NumberColumn("PH Units Chronic", format="%d"),
+                "price_hiked_units_acute": st.column_config.NumberColumn("PH Units Acute", format="%d"),
+                "price_hiked_skus_chronic": st.column_config.NumberColumn("PH SKU Chronic", format="%d"),
+                "price_hiked_skus_acute": st.column_config.NumberColumn("PH SKU Acute", format="%d"),
+            },
+        )
+        st.download_button(
+            "📥 Download CSV",
+            data=df_in.to_csv(index=False).encode("utf-8"),
+            file_name=filename,
+            mime="text/csv",
+            key=dl_key,
+        )
+
     if not cohort_ids_sum:
         st.info("Cohort is empty for the current filters.")
     else:
@@ -373,45 +411,54 @@ with tab_summary:
             st.warning("`data_snapshots/sales.parquet` missing — refresh snapshots to populate.")
         else:
             cat_lookup = _load_sku_category()
-            monthly = compute_cohort_monthly_history(
-                snap, cohort_ids_sum, sku_ids, cat_lookup, tuple(selected_pilots),
+
+            # Derive "5-month regulars" — patients active chain-wide in every calendar
+            # month in the window (any chain store, not just pilot stores).
+            activity = fetch_patient_monthly_activity(
+                tuple(sorted(cohort_ids_sum)),
+                "2026-01-01",
+                QUANT_POST_END.isoformat(),
             )
-            if monthly.empty:
-                st.info("No historical activity found for this cohort in the snapshot.")
+            if activity.empty:
+                regulars_ids: set[int] = set()
+                expected_months = 0
             else:
-                display_monthly = monthly.copy()
-                display_monthly["frequency"] = display_monthly["frequency"].round(2)
-                int_cols = [c for c in display_monthly.columns if c not in ("month", "frequency")]
-                display_monthly[int_cols] = display_monthly[int_cols].astype(int)
-                st.dataframe(
-                    display_monthly,
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "month": st.column_config.Column("Month", pinned=True),
-                        "bills": st.column_config.NumberColumn("Bills", format="%d"),
-                        "patients": st.column_config.NumberColumn("Patients", format="%d"),
-                        "frequency": st.column_config.NumberColumn("Frequency", format="%.2f"),
-                        "total_units": st.column_config.NumberColumn("Total Units", format="%d"),
-                        "total_skus": st.column_config.NumberColumn("Total SKU", format="%d"),
-                        "total_units_chronic": st.column_config.NumberColumn("Total Units Chronic", format="%d"),
-                        "total_units_acute": st.column_config.NumberColumn("Total Units Acute", format="%d"),
-                        "total_skus_chronic": st.column_config.NumberColumn("Total SKU Chronic", format="%d"),
-                        "total_skus_acute": st.column_config.NumberColumn("Total SKU Acute", format="%d"),
-                        "price_hiked_units": st.column_config.NumberColumn("Price Hiked Units", format="%d"),
-                        "price_hiked_skus": st.column_config.NumberColumn("Price Hiked SKU", format="%d"),
-                        "price_hiked_units_chronic": st.column_config.NumberColumn("PH Units Chronic", format="%d"),
-                        "price_hiked_units_acute": st.column_config.NumberColumn("PH Units Acute", format="%d"),
-                        "price_hiked_skus_chronic": st.column_config.NumberColumn("PH SKU Chronic", format="%d"),
-                        "price_hiked_skus_acute": st.column_config.NumberColumn("PH SKU Acute", format="%d"),
-                    },
+                months_per_patient = activity.groupby("patient_id")["month"].nunique()
+                expected_months = int(activity["month"].nunique())
+                regulars_ids = set(
+                    int(p) for p, n in months_per_patient.items() if n == expected_months
                 )
-                st.download_button(
-                    "📥 Download cohort monthly history",
-                    data=monthly.to_csv(index=False).encode("utf-8"),
-                    file_name="cohort_monthly_history.csv",
-                    mime="text/csv",
+
+            tab_all, tab_reg = st.tabs([
+                f"All cohort ({len(cohort_ids_sum):,})",
+                f"{expected_months}-month regulars ({len(regulars_ids):,})",
+            ])
+
+            with tab_all:
+                monthly_all = compute_cohort_monthly_history(
+                    snap, cohort_ids_sum, sku_ids, cat_lookup, tuple(selected_pilots),
                 )
+                if monthly_all.empty:
+                    st.info("No historical activity found for this cohort in the snapshot.")
+                else:
+                    _render_monthly_table(monthly_all, "cohort_monthly_history.csv", "dl_cohort_all")
+
+            with tab_reg:
+                if not regulars_ids:
+                    st.info("No patients were active in every calendar month of the window.")
+                else:
+                    st.caption(
+                        f"**{len(regulars_ids):,} patients** had ≥1 bill at any chain store in "
+                        f"**every** calendar month of the window ({expected_months} months total). "
+                        "KPIs measured at pilot stores only — same scope as 'All cohort', so values are directly comparable."
+                    )
+                    monthly_reg = compute_cohort_monthly_history(
+                        snap, regulars_ids, sku_ids, cat_lookup, tuple(selected_pilots),
+                    )
+                    if monthly_reg.empty:
+                        st.info("Regulars cohort had no activity in pilot stores during the window.")
+                    else:
+                        _render_monthly_table(monthly_reg, "cohort_5month_regulars.csv", "dl_cohort_reg")
 
     # Inline Cohort SKU pre/post — same as the dedicated 🎯 tab, contextual to Summary's cohort
     with st.expander("📋 Cohort SKU pre/post — for the patients shown above", expanded=False):

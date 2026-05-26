@@ -718,6 +718,47 @@ def fetch_quant_sales(stores: tuple[str, ...], date_from: str, date_to: str) -> 
     return df
 
 
+@st.cache_data(ttl=1800, show_spinner="Resolving chain-wide monthly activity…")
+def fetch_patient_monthly_activity(
+    patient_ids: tuple[int, ...],
+    date_from: str,
+    date_to: str,
+) -> pd.DataFrame:
+    """For the given patients, return one row per (patient_id, calendar_month)
+    they have ≥1 gross bill in ANY chain store between date_from and date_to.
+
+    Returns DataFrame with columns: patient_id (int), month (YYYY-MM string).
+    Live Redshift query — the local snapshot only covers 14 stores, so it can't
+    tell us about chain-wide activity. For ~2,500 patients × 5 months this
+    returns ≤12,500 rows, well under a second."""
+    if not patient_ids:
+        return pd.DataFrame(columns=["patient_id", "month"])
+
+    rows: list[tuple] = []
+    chunk_size = 1000
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for i in range(0, len(patient_ids), chunk_size):
+                chunk = tuple(patient_ids[i:i + chunk_size])
+                cur.execute(
+                    """
+                    SELECT DISTINCT "patient-id",
+                                    TO_CHAR("created-at", 'YYYY-MM') AS month
+                    FROM "prod2-generico"."sales"
+                    WHERE "patient-id" IN %s
+                      AND "created-at"::date BETWEEN %s AND %s
+                      AND "bill-flag" = 'gross'
+                    """,
+                    (chunk, date_from, date_to),
+                )
+                rows.extend(cur.fetchall())
+    df = pd.DataFrame(rows, columns=["patient_id", "month"])
+    if not df.empty:
+        df["patient_id"] = df["patient_id"].astype(int)
+        df["month"] = df["month"].astype(str)
+    return df
+
+
 def compute_kpis(
     df: pd.DataFrame,
     sku_ids: set[int] | None = None,
