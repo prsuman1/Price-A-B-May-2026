@@ -47,6 +47,7 @@ PATIENTS_SNAPSHOT = SNAPSHOTS_DIR / "patients_first_seen.parquet"  # patient_id 
 PARTIAL_BILL_SNAPSHOT = SNAPSHOTS_DIR / "partial_bill_history.parquet"  # partial-bill patients' price-↑ SKU history, all stores
 SKU_CATEGORY_SNAPSHOT = SNAPSHOTS_DIR / "sku_category.parquet"  # drug_id → category lookup for price-↑ SKUs
 COHORT_HISTORY_SNAPSHOT = SNAPSHOTS_DIR / "cohort_chronic_history.parquet"  # 6mo all-store history of chronic price-↑ SKUs for the pilot-post cohort
+SUBSTITUTION_SNAPSHOT = SNAPSHOTS_DIR / "drug_substitution_mapping.parquet"  # drug_id → group_id (same-composition mapping) for drugs in the sales snapshot
 
 COHORT_HISTORY_START = pd.Timestamp("2025-11-06").date()  # 6 months pre-go-live
 REFILL_GRACE_DAYS = 7  # grace before flagging a patient overdue
@@ -1008,6 +1009,18 @@ def _load_sku_category() -> dict[int, str]:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def _load_substitution_snapshot() -> dict[int, int]:
+    """`drug_id -> group_identifier` lookup for the same-composition mapping.
+    Built by refresh_snapshots.py for every drug_id that appears in the local
+    sales snapshot. Returns an empty dict if the snapshot is missing
+    (substitution-funnel UI gracefully shows zeros)."""
+    if not SUBSTITUTION_SNAPSHOT.exists():
+        return {}
+    df = pd.read_parquet(SUBSTITUTION_SNAPSHOT)
+    return dict(zip(df["drug_id"].astype(int), df["group_id"].astype(int)))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def _load_partial_bill_snapshot() -> pd.DataFrame | None:
     """Load partial-bill cohort history: their 4-month pre + post purchases of
     price-↑ SKUs across all chain stores. Returns None if missing."""
@@ -1047,6 +1060,98 @@ def compute_cohort_sku_pre_post(
     cols = ["drug_id", "pre_qty", "post_qty", "delta_qty",
             "delta_qty_pct", "pre_revenue", "post_revenue"]
     return out[cols].sort_values("post_qty", ascending=False)
+
+
+def compute_substitution_funnel(
+    pre_df: pd.DataFrame,
+    post_df: pd.DataFrame,
+    cohort_patient_ids: set[int],
+    sku_ids: set[int],
+    group_lookup: dict[int, int],
+    pilot_stores: tuple[str, ...],
+) -> pd.DataFrame:
+    """Per price-↑ SKU, classify each cohort pre-buyer's post-window outcome
+    inside that drug's same-composition group.
+
+    Inputs:
+      pre_df, post_df          — gross-bill line items, any pre-filter ok
+      cohort_patient_ids       — patients in scope (e.g. Pilot Post cohort)
+      sku_ids                  — the 346 price-↑ SKU drug_ids
+      group_lookup             — drug_id → group_identifier (from substitution snapshot)
+      pilot_stores             — restrict both pre and post to these stores
+
+    Per (patient, price-↑ SKU `d` they bought pre), one of four buckets:
+      - stayed             : bought drug_id == d post
+      - switched_subs      : bought a different drug_id in same group, NOT price-↑
+      - switched_other_pi  : bought a different drug_id in same group, also price-↑
+      - lapsed             : no post buy in same group at pilot stores
+
+    Returns one row per price-↑ drug_id with non-zero pre-buyers:
+      drug_id, n_pre_buyers, n_stayed, n_switched_subs, n_switched_other_pi, n_lapsed
+    """
+    cols = ["drug_id", "n_pre_buyers", "n_stayed",
+            "n_switched_subs", "n_switched_other_pi", "n_lapsed"]
+    if pre_df is None or pre_df.empty or not cohort_patient_ids or not sku_ids:
+        return pd.DataFrame(columns=cols)
+
+    def slice_pilot_gross(df: pd.DataFrame) -> pd.DataFrame:
+        g = df[df["bill_flag"] == "gross"]
+        if pilot_stores:
+            g = g[g["store_name"].isin(pilot_stores)]
+        g = g[g["patient_id"].astype("Int64").isin(cohort_patient_ids)]
+        return g[["patient_id", "drug_id"]].dropna()
+
+    pre = slice_pilot_gross(pre_df).copy()
+    post = slice_pilot_gross(post_df).copy()
+    if pre.empty:
+        return pd.DataFrame(columns=cols)
+
+    # Cast to plain int for fast set ops.
+    pre["drug_id"] = pre["drug_id"].astype(int)
+    pre["patient_id"] = pre["patient_id"].astype(int)
+    post["drug_id"] = post["drug_id"].astype(int)
+    post["patient_id"] = post["patient_id"].astype(int)
+
+    # Restrict pre to price-↑ purchases (the only "exposures" we care about).
+    pre_pi = pre[pre["drug_id"].isin(sku_ids)].drop_duplicates()
+    if pre_pi.empty:
+        return pd.DataFrame(columns=cols)
+
+    # Pre-compute each patient's full set of post drug_ids and their group_ids.
+    post_by_pat = post.groupby("patient_id")["drug_id"].agg(lambda s: set(s.tolist())).to_dict()
+
+    rows: list[dict] = []
+    sku_ids_set = set(int(x) for x in sku_ids)
+    # Group exposures by price-↑ drug_id.
+    for d, grp in pre_pi.groupby("drug_id"):
+        d_group = group_lookup.get(int(d))
+        stayed = switched_subs = switched_other_pi = lapsed = 0
+        for pid in grp["patient_id"].unique():
+            post_drugs = post_by_pat.get(pid, set())
+            if d in post_drugs:
+                stayed += 1
+                continue
+            if d_group is None:
+                lapsed += 1
+                continue
+            # Other drugs the patient bought in the same composition group.
+            same_group = [x for x in post_drugs if group_lookup.get(int(x)) == d_group]
+            if not same_group:
+                lapsed += 1
+            elif any(x in sku_ids_set for x in same_group):
+                switched_other_pi += 1
+            else:
+                switched_subs += 1
+        rows.append({
+            "drug_id": int(d),
+            "n_pre_buyers": int(grp["patient_id"].nunique()),
+            "n_stayed": stayed,
+            "n_switched_subs": switched_subs,
+            "n_switched_other_pi": switched_other_pi,
+            "n_lapsed": lapsed,
+        })
+
+    return pd.DataFrame(rows, columns=cols).sort_values("n_pre_buyers", ascending=False)
 
 
 def compute_cohort_monthly_history(

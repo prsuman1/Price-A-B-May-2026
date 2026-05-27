@@ -28,6 +28,7 @@ from data import (
     _load_sales_snapshot,
     _load_sku_category,
     _load_store_totals_snapshot,
+    _load_substitution_snapshot,
     aggregate_totals,
     build_pair_table,
     compute_cohort_monthly_history,
@@ -35,6 +36,7 @@ from data import (
     compute_elasticity,
     compute_kpis,
     compute_repeat_churn,
+    compute_substitution_funnel,
     fetch_patient_monthly_activity,
     fetch_quant_sales,
     load_skus,
@@ -459,6 +461,82 @@ with tab_summary:
                         st.info("Regulars cohort had no activity in pilot stores during the window.")
                     else:
                         _render_monthly_table(monthly_reg, "cohort_5month_regulars.csv", "dl_cohort_reg")
+
+    # Same-composition substitution funnel
+    with st.expander("🔄 Same-composition substitution — where did the price-↑ buyers go?", expanded=False):
+        st.caption(
+            "For each price-↑ SKU the cohort bought in the **pre-window** at pilot stores, "
+            "what did the same patient do in the **post-window**: refilled the same drug, switched to a "
+            "**different brand of the same molecule** (same-composition substitute), or stopped buying that composition entirely. "
+            "Substitution mapping comes from `drug-substitution-mapping` and is restricted to drugs the cohort actually transacted."
+        )
+        group_lookup = _load_substitution_snapshot()
+        if not group_lookup:
+            st.info("`data_snapshots/drug_substitution_mapping.parquet` missing — refresh snapshots to populate.")
+        elif not cohort_ids_sum:
+            st.info("Cohort is empty for the current filters.")
+        else:
+            funnel = compute_substitution_funnel(
+                pilot_pre_summary_df, pilot_post_summary_df,
+                cohort_ids_sum, sku_ids, group_lookup, tuple(selected_pilots),
+            )
+            if funnel.empty:
+                st.info("No price-↑ SKU pre-buyers found in this cohort at the selected pilot stores.")
+            else:
+                t_pre = int(funnel["n_pre_buyers"].sum())
+                t_stay = int(funnel["n_stayed"].sum())
+                t_sub = int(funnel["n_switched_subs"].sum())
+                t_opi = int(funnel["n_switched_other_pi"].sum())
+                t_lap = int(funnel["n_lapsed"].sum())
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("👥 Pre-buyer exposures", f"{t_pre:,}",
+                          help="Count of (patient × price-↑ SKU) pairs where the patient bought that SKU at a pilot store pre-go-live.")
+                c2.metric("✅ Stayed", f"{t_stay:,}", f"{t_stay/t_pre*100:.1f}%" if t_pre else "—",
+                          help="Bought the SAME drug again post-go-live at pilot stores.")
+                c3.metric("🔄 Switched to substitute", f"{t_sub:,}",
+                          f"{t_sub/t_pre*100:.1f}%" if t_pre else "—",
+                          help="Bought a different brand of the same molecule that was NOT price-hiked. Customer kept; some margin lost.")
+                c4.metric("⚠️ Switched to other PI", f"{t_opi:,}",
+                          f"{t_opi/t_pre*100:.1f}%" if t_pre else "—",
+                          help="Bought a different brand in the same molecule that was ALSO price-hiked.")
+                c5.metric("📉 Lapsed", f"{t_lap:,}", f"{t_lap/t_pre*100:.1f}%" if t_pre else "—",
+                          delta_color="inverse",
+                          help="No purchase in that composition group post-go-live at pilot stores.")
+
+                sku_meta = skus[["drug_id", "drug_name", "drug_type", "old_price", "new_price"]]
+                display = funnel.merge(sku_meta, on="drug_id", how="left")
+                display["switched_subs_%"] = (display["n_switched_subs"] / display["n_pre_buyers"] * 100).round(1)
+                display["lapsed_%"] = (display["n_lapsed"] / display["n_pre_buyers"] * 100).round(1)
+                display = display[[
+                    "drug_id", "drug_name", "drug_type", "old_price", "new_price",
+                    "n_pre_buyers", "n_stayed", "n_switched_subs", "n_switched_other_pi", "n_lapsed",
+                    "switched_subs_%", "lapsed_%",
+                ]].sort_values("n_switched_subs", ascending=False)
+
+                st.dataframe(
+                    display, width="stretch", hide_index=True,
+                    column_config={
+                        "drug_id": st.column_config.NumberColumn("Drug ID", format="%d"),
+                        "drug_name": st.column_config.Column("Drug", pinned=True),
+                        "drug_type": "Type",
+                        "old_price": st.column_config.NumberColumn("Old ₹", format="%.2f"),
+                        "new_price": st.column_config.NumberColumn("New ₹", format="%.2f"),
+                        "n_pre_buyers": st.column_config.NumberColumn("Pre-buyers", format="%d"),
+                        "n_stayed": st.column_config.NumberColumn("Stayed", format="%d"),
+                        "n_switched_subs": st.column_config.NumberColumn("→ Substitute", format="%d"),
+                        "n_switched_other_pi": st.column_config.NumberColumn("→ Other PI", format="%d"),
+                        "n_lapsed": st.column_config.NumberColumn("Lapsed", format="%d"),
+                        "switched_subs_%": st.column_config.NumberColumn("Sub %", format="%.1f"),
+                        "lapsed_%": st.column_config.NumberColumn("Lapsed %", format="%.1f"),
+                    },
+                )
+                st.download_button(
+                    "📥 Download substitution funnel",
+                    data=display.to_csv(index=False).encode("utf-8"),
+                    file_name="substitution_funnel.csv",
+                    mime="text/csv",
+                    key="dl_subs_funnel",
+                )
 
     # Inline Cohort SKU pre/post — same as the dedicated 🎯 tab, contextual to Summary's cohort
     with st.expander("📋 Cohort SKU pre/post — for the patients shown above", expanded=False):

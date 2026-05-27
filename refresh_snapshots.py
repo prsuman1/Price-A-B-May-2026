@@ -40,6 +40,7 @@ from data import (
     SALES_SNAPSHOT,
     SKU_CATEGORY_SNAPSHOT,
     SNAPSHOTS_DIR,
+    SUBSTITUTION_SNAPSHOT,
     STORE_PAIRS,
     STORE_TOTALS_SNAPSHOT,
     STORE_MAP,
@@ -291,6 +292,37 @@ def fill_new_patient_count(store_totals: pd.DataFrame, patients_df: pd.DataFrame
     return store_totals
 
 
+def fetch_substitution_mapping(drug_ids: list[int]) -> pd.DataFrame:
+    """For the given drug_ids, pull drug_id → group_identifier from the
+    drug-substitution-mapping table. Active rows only. Chunked at 1000."""
+    cols = ["drug_id", "group_id"]
+    if not drug_ids:
+        return pd.DataFrame(columns=cols)
+    rows: list[tuple] = []
+    chunk = 1000
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            for i in range(0, len(drug_ids), chunk):
+                batch = tuple(int(x) for x in drug_ids[i:i + chunk])
+                cur.execute(
+                    """
+                    SELECT DISTINCT "drug-id", "group-identifier"
+                    FROM "prod2-generico"."drug-substitution-mapping"
+                    WHERE "is-active" = 1
+                      AND "group-identifier" IS NOT NULL
+                      AND "drug-id" IN %s
+                    """,
+                    (batch,),
+                )
+                rows.extend(cur.fetchall())
+    df = pd.DataFrame(rows, columns=cols)
+    if not df.empty:
+        df["drug_id"] = pd.to_numeric(df["drug_id"], errors="coerce").astype("Int64")
+        df["group_id"] = pd.to_numeric(df["group_id"], errors="coerce").astype("Int64")
+        df = df.dropna().drop_duplicates(subset=["drug_id"]).reset_index(drop=True)
+    return df
+
+
 def main() -> int:
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -304,21 +336,21 @@ def main() -> int:
     print()
 
     # 1) Line-level sales for the 14 pair-related stores.
-    print(f"[1/6] Line-level sales for {len(pair_related_stores)} pair-related stores…")
+    print(f"[1/7] Line-level sales for {len(pair_related_stores)} pair-related stores…")
     sales = fetch_sales_snapshot(pair_related_stores, date_from, date_to)
     sales.to_parquet(SALES_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
     print(f"  → {SALES_SNAPSHOT.name}: {len(sales):,} rows · {SALES_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print()
 
     # 2) Patients-first-seen for the 14 stores' patients.
-    print(f"[2/6] Patients first-seen…")
+    print(f"[2/7] Patients first-seen…")
     patients = build_patients_first_seen(pair_related_stores, date_from, date_to)
     patients.to_parquet(PATIENTS_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
     print(f"  → {PATIENTS_SNAPSHOT.name}: {len(patients):,} patients · {PATIENTS_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     print()
 
     # 3) SKU category lookup (small file).
-    print(f"[3/6] SKU category lookup for price-↑ SKUs…")
+    print(f"[3/7] SKU category lookup for price-↑ SKUs…")
     skus = load_skus()
     sku_ids = set(skus["drug_id"].astype(int))
     sku_cat_df = fetch_sku_category(sku_ids)
@@ -329,7 +361,7 @@ def main() -> int:
     print()
 
     # 4) Per-store-per-day-per-bill-set totals for ALL chain stores.
-    print(f"[4/6] Per-store-per-day aggregates (ALL stores)…")
+    print(f"[4/7] Per-store-per-day aggregates (ALL stores)…")
     totals = build_store_totals(date_from, date_to, sku_ids, sku_category=sku_cat_lookup)
     totals = fill_new_patient_count(totals, patients)
     totals.to_parquet(STORE_TOTALS_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
@@ -338,7 +370,7 @@ def main() -> int:
     print()
 
     # 5) Partial-bill cohort: 4-month pre + post price-↑ SKU history (ALL stores).
-    print(f"[5/6] Partial-bill cohort history…")
+    print(f"[5/7] Partial-bill cohort history…")
     bundle = build_joined()
     pb_bills = bundle["bills"]
     pb_bills = pb_bills[pb_bills["is_amber_partial"].fillna(False)]
@@ -352,7 +384,7 @@ def main() -> int:
     print()
 
     # 6) Chronic-cohort 6-month history (ALL chain stores).
-    print(f"[6/6] Chronic-cohort 6-month history…")
+    print(f"[6/7] Chronic-cohort 6-month history…")
     chronic_ids = {int(d) for d, c in sku_cat_lookup.items() if c == "chronic"}
     print(f"  Chronic price-↑ SKUs: {len(chronic_ids)}")
     # Cohort = patients who bought a chronic price-↑ SKU at a PILOT store
@@ -364,6 +396,17 @@ def main() -> int:
     print(f"  → {COHORT_HISTORY_SNAPSHOT.name}: {len(coh_history):,} rows · {COHORT_HISTORY_SNAPSHOT.stat().st_size/1e6:.1f} MB")
     if len(coh_history):
         print(f"     date range: {coh_history['created_at'].min()} → {coh_history['created_at'].max()}")
+    print()
+
+    # 7) Same-composition substitution mapping for the drug_ids in the sales snapshot.
+    print(f"[7/7] Drug-substitution mapping (same-composition groups)…")
+    snap_drug_ids = sorted({int(x) for x in sales["drug_id"].dropna().unique()})
+    print(f"  Distinct drug_ids in sales snapshot: {len(snap_drug_ids):,}")
+    sub_df = fetch_substitution_mapping(snap_drug_ids)
+    sub_df.to_parquet(SUBSTITUTION_SNAPSHOT, engine="pyarrow", compression="snappy", index=False)
+    print(f"  → {SUBSTITUTION_SNAPSHOT.name}: {len(sub_df):,} mappings · "
+          f"{sub_df['group_id'].nunique():,} distinct groups · "
+          f"{SUBSTITUTION_SNAPSHOT.stat().st_size/1e3:.1f} KB")
     print()
     print("Done.")
     return 0
