@@ -1154,6 +1154,88 @@ def compute_substitution_funnel(
     return pd.DataFrame(rows, columns=cols).sort_values("n_pre_buyers", ascending=False)
 
 
+def compute_group_contribution_pre_post(
+    pre_df: pd.DataFrame,
+    post_df: pd.DataFrame,
+    cohort_patient_ids: set[int],
+    sku_ids: set[int],
+    group_lookup: dict[int, int],
+    pilot_stores: tuple[str, ...],
+) -> pd.DataFrame:
+    """Per composition group containing ≥1 price-↑ SKU, sum units split
+    between PI and non-PI drugs in pre vs post windows. Cohort-restricted
+    to pilot stores. Lets us see volume share shift inside each molecule.
+
+    Output columns:
+      group_id, n_pi_skus_in_group_hiked,
+      pre_pi_units, pre_non_pi_units, pre_total_units, pre_pi_share,
+      post_pi_units, post_non_pi_units, post_total_units, post_pi_share,
+      delta_pi_share_pp
+    """
+    cols = [
+        "group_id", "n_pi_skus_in_group_hiked",
+        "pre_pi_units", "pre_non_pi_units", "pre_total_units", "pre_pi_share",
+        "post_pi_units", "post_non_pi_units", "post_total_units", "post_pi_share",
+        "delta_pi_share_pp",
+    ]
+    if not cohort_patient_ids or not group_lookup or not sku_ids:
+        return pd.DataFrame(columns=cols)
+
+    sku_ids_set = set(int(x) for x in sku_ids)
+
+    def slice_with_groups(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["group_id", f"{suffix}_pi_units", f"{suffix}_non_pi_units"])
+        g = df[df["bill_flag"] == "gross"]
+        if pilot_stores:
+            g = g[g["store_name"].isin(pilot_stores)]
+        g = g[g["patient_id"].astype("Int64").isin(cohort_patient_ids)]
+        if g.empty:
+            return pd.DataFrame(columns=["group_id", f"{suffix}_pi_units", f"{suffix}_non_pi_units"])
+        # Map drug_id → group_id, drop unmapped.
+        gg = g[["drug_id", "net_quantity"]].copy()
+        gg["drug_id"] = gg["drug_id"].astype("Int64")
+        gg["group_id"] = gg["drug_id"].map(lambda d: group_lookup.get(int(d)) if pd.notna(d) else None)
+        gg = gg.dropna(subset=["group_id"])
+        if gg.empty:
+            return pd.DataFrame(columns=["group_id", f"{suffix}_pi_units", f"{suffix}_non_pi_units"])
+        gg["is_pi"] = gg["drug_id"].astype(int).isin(sku_ids_set)
+        agg = (gg.groupby(["group_id", "is_pi"])["net_quantity"].sum().unstack(fill_value=0.0))
+        # Ensure both columns exist
+        if True not in agg.columns: agg[True] = 0.0
+        if False not in agg.columns: agg[False] = 0.0
+        agg = agg.rename(columns={True: f"{suffix}_pi_units", False: f"{suffix}_non_pi_units"}).reset_index()
+        agg["group_id"] = agg["group_id"].astype(int)
+        return agg[["group_id", f"{suffix}_pi_units", f"{suffix}_non_pi_units"]]
+
+    pre_agg = slice_with_groups(pre_df, "pre")
+    post_agg = slice_with_groups(post_df, "post")
+    out = pre_agg.merge(post_agg, on="group_id", how="outer").fillna(0.0)
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    # Keep only groups that contain ≥1 of the 346 price-↑ SKUs
+    pi_groups = {int(group_lookup[int(d)]) for d in sku_ids_set if int(d) in group_lookup}
+    out = out[out["group_id"].astype(int).isin(pi_groups)].copy()
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+
+    # n_pi_skus_in_group_hiked
+    pi_count_by_group: dict[int, int] = {}
+    for d in sku_ids_set:
+        gid = group_lookup.get(int(d))
+        if gid is not None:
+            pi_count_by_group[int(gid)] = pi_count_by_group.get(int(gid), 0) + 1
+    out["n_pi_skus_in_group_hiked"] = out["group_id"].astype(int).map(pi_count_by_group).fillna(0).astype(int)
+
+    out["pre_total_units"] = out["pre_pi_units"] + out["pre_non_pi_units"]
+    out["post_total_units"] = out["post_pi_units"] + out["post_non_pi_units"]
+    out["pre_pi_share"] = (out["pre_pi_units"] / out["pre_total_units"]).where(out["pre_total_units"] > 0)
+    out["post_pi_share"] = (out["post_pi_units"] / out["post_total_units"]).where(out["post_total_units"] > 0)
+    out["delta_pi_share_pp"] = (out["post_pi_share"] - out["pre_pi_share"]) * 100
+
+    return out[cols].sort_values("pre_total_units", ascending=False).reset_index(drop=True)
+
+
 def compute_cohort_monthly_history(
     sales_df: pd.DataFrame,
     cohort_ids: set[int],

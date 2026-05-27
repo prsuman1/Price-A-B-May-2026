@@ -34,6 +34,7 @@ from data import (
     compute_cohort_monthly_history,
     compute_cohort_sku_pre_post,
     compute_elasticity,
+    compute_group_contribution_pre_post,
     compute_kpis,
     compute_repeat_churn,
     compute_substitution_funnel,
@@ -602,6 +603,74 @@ with tab_summary:
                         file_name="substitution_funnel_by_group.csv",
                         mime="text/csv",
                         key="dl_subs_funnel_grp",
+                    )
+
+                # ----- Per composition group — PI vs non-PI unit contribution
+                contrib = compute_group_contribution_pre_post(
+                    pilot_pre_summary_df, pilot_post_summary_df,
+                    cohort_ids_sum, sku_ids, group_lookup, tuple(selected_pilots),
+                )
+                if contrib.empty:
+                    st.info("No cohort transactions in any composition group containing a price-↑ SKU.")
+                else:
+                    # Build comma-separated PI drug names per group
+                    pi_in_group: dict[int, list[str]] = {int(g): [] for g in contrib["group_id"].astype(int)}
+                    sku_name_lookup = dict(zip(skus["drug_id"].astype(int), skus["drug_name"]))
+                    for d, gid in group_lookup.items():
+                        d_i = int(d)
+                        if d_i in sku_ids:
+                            gid_i = int(gid)
+                            if gid_i in pi_in_group:
+                                pi_in_group[gid_i].append(sku_name_lookup.get(d_i, f"drug_{d_i}"))
+                    contrib_disp = contrib.copy()
+                    contrib_disp["price_hiked_drugs"] = contrib_disp["group_id"].astype(int).map(
+                        lambda g: ", ".join(sorted(pi_in_group.get(g, [])))
+                    )
+                    # Convert units to int, shares to %
+                    for c in ["pre_pi_units","pre_non_pi_units","pre_total_units",
+                              "post_pi_units","post_non_pi_units","post_total_units"]:
+                        contrib_disp[c] = contrib_disp[c].round(0).astype(int)
+                    contrib_disp["pre_pi_share_%"] = (contrib_disp["pre_pi_share"] * 100).round(1)
+                    contrib_disp["post_pi_share_%"] = (contrib_disp["post_pi_share"] * 100).round(1)
+                    contrib_disp["delta_pi_share_pp"] = contrib_disp["delta_pi_share_pp"].round(1)
+                    contrib_disp["group_id"] = contrib_disp["group_id"].astype(int)
+                    contrib_disp = contrib_disp[[
+                        "group_id", "price_hiked_drugs", "n_pi_skus_in_group_hiked",
+                        "pre_pi_units", "pre_non_pi_units", "pre_pi_share_%",
+                        "post_pi_units", "post_non_pi_units", "post_pi_share_%",
+                        "delta_pi_share_pp",
+                    ]].sort_values("pre_pi_units", ascending=False)
+
+                    st.markdown("**Per composition group — PI vs non-PI unit contribution (pre vs post)**")
+                    st.caption(
+                        "For each composition group with ≥1 price-↑ SKU, how many **units** the cohort bought from the "
+                        "price-↑ drug(s) vs from non-price-↑ substitutes in the same molecule, in pre window vs post window. "
+                        "`delta_pi_share_pp` = post PI share − pre PI share (percentage points). Negative = customers shifted "
+                        "away from the price-↑ brand."
+                    )
+                    st.dataframe(
+                        contrib_disp, width="stretch", hide_index=True,
+                        column_config={
+                            "group_id": st.column_config.NumberColumn("Group ID", format="%d"),
+                            "price_hiked_drugs": st.column_config.Column("Price-↑ drugs in group", pinned=True,
+                                help="Comma-separated names of the SKUs in this group that are in the 346 price-↑ list."),
+                            "n_pi_skus_in_group_hiked": st.column_config.NumberColumn("# PI SKUs", format="%d"),
+                            "pre_pi_units": st.column_config.NumberColumn("Pre PI units", format="%d"),
+                            "pre_non_pi_units": st.column_config.NumberColumn("Pre non-PI units", format="%d"),
+                            "pre_pi_share_%": st.column_config.NumberColumn("Pre PI %", format="%.1f"),
+                            "post_pi_units": st.column_config.NumberColumn("Post PI units", format="%d"),
+                            "post_non_pi_units": st.column_config.NumberColumn("Post non-PI units", format="%d"),
+                            "post_pi_share_%": st.column_config.NumberColumn("Post PI %", format="%.1f"),
+                            "delta_pi_share_pp": st.column_config.NumberColumn("Δ PI share (pp)", format="%.1f",
+                                help="post_pi_share − pre_pi_share, in percentage points."),
+                        },
+                    )
+                    st.download_button(
+                        "📥 Download PI vs non-PI contribution",
+                        data=contrib_disp.to_csv(index=False).encode("utf-8"),
+                        file_name="group_pi_contribution_pre_post.csv",
+                        mime="text/csv",
+                        key="dl_subs_funnel_contrib",
                     )
 
     # Inline Cohort SKU pre/post — same as the dedicated 🎯 tab, contextual to Summary's cohort
