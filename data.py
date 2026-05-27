@@ -1157,14 +1157,19 @@ def compute_substitution_funnel(
 def compute_group_contribution_pre_post(
     pre_df: pd.DataFrame,
     post_df: pd.DataFrame,
-    cohort_patient_ids: set[int],
+    cohort_patient_ids: set[int] | None,
     sku_ids: set[int],
     group_lookup: dict[int, int],
     pilot_stores: tuple[str, ...],
 ) -> pd.DataFrame:
     """Per composition group containing ≥1 price-↑ SKU, sum units split
-    between PI and non-PI drugs in pre vs post windows. Cohort-restricted
-    to pilot stores. Lets us see volume share shift inside each molecule.
+    between PI and non-PI drugs in pre vs post windows. Restricted to
+    pilot stores. Cohort filter optional.
+
+    `cohort_patient_ids` semantics:
+      - None              → no cohort filter (all patients at pilot stores)
+      - non-empty set     → restrict to these patient_ids
+      - empty set         → return empty (caller signalled an empty cohort)
 
     Output columns:
       group_id, n_pi_skus_in_group_hiked,
@@ -1178,7 +1183,9 @@ def compute_group_contribution_pre_post(
         "post_pi_units", "post_non_pi_units", "post_total_units", "post_pi_share",
         "delta_pi_share_pp",
     ]
-    if not cohort_patient_ids or not group_lookup or not sku_ids:
+    if not group_lookup or not sku_ids:
+        return pd.DataFrame(columns=cols)
+    if cohort_patient_ids is not None and len(cohort_patient_ids) == 0:
         return pd.DataFrame(columns=cols)
 
     sku_ids_set = set(int(x) for x in sku_ids)
@@ -1189,7 +1196,8 @@ def compute_group_contribution_pre_post(
         g = df[df["bill_flag"] == "gross"]
         if pilot_stores:
             g = g[g["store_name"].isin(pilot_stores)]
-        g = g[g["patient_id"].astype("Int64").isin(cohort_patient_ids)]
+        if cohort_patient_ids is not None:
+            g = g[g["patient_id"].astype("Int64").isin(cohort_patient_ids)]
         if g.empty:
             return pd.DataFrame(columns=["group_id", f"{suffix}_pi_units", f"{suffix}_non_pi_units"])
         # Map drug_id → group_id, drop unmapped.

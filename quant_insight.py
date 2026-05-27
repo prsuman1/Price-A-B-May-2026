@@ -606,9 +606,19 @@ with tab_summary:
                     )
 
                 # ----- Per composition group — PI vs non-PI unit contribution
+                st.markdown("**Per composition group — PI vs non-PI unit contribution (pre vs post)**")
+                contrib_scope = st.radio(
+                    "Scope",
+                    ["Cohort only", "All pilot patients"],
+                    horizontal=True, key="contrib_scope",
+                    help=("**Cohort only** = the dynamic Pilot Post cohort (same patients as the funnel tables above). "
+                          "**All pilot patients** = drops the cohort filter; counts every patient ever shopping at the 7 pilot stores. "
+                          "Useful for a complete pilot-store group-share picture."),
+                )
+                contrib_cohort = cohort_ids_sum if contrib_scope == "Cohort only" else None
                 contrib = compute_group_contribution_pre_post(
                     pilot_pre_summary_df, pilot_post_summary_df,
-                    cohort_ids_sum, sku_ids, group_lookup, tuple(selected_pilots),
+                    contrib_cohort, sku_ids, group_lookup, tuple(selected_pilots),
                 )
                 if contrib.empty:
                     st.info("No cohort transactions in any composition group containing a price-↑ SKU.")
@@ -641,9 +651,10 @@ with tab_summary:
                         "delta_pi_share_pp",
                     ]].sort_values("pre_pi_units", ascending=False)
 
-                    st.markdown("**Per composition group — PI vs non-PI unit contribution (pre vs post)**")
+                    scope_note = ("cohort patients only" if contrib_scope == "Cohort only"
+                                  else "**all patients** at pilot stores")
                     st.caption(
-                        "For each composition group with ≥1 price-↑ SKU, how many **units** the cohort bought from the "
+                        f"For each composition group with ≥1 price-↑ SKU, how many **units** {scope_note} bought from the "
                         "price-↑ drug(s) vs from non-price-↑ substitutes in the same molecule, in pre window vs post window. "
                         "`delta_pi_share_pp` = post PI share − pre PI share (percentage points). Negative = customers shifted "
                         "away from the price-↑ brand."
