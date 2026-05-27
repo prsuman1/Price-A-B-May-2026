@@ -505,20 +505,24 @@ with tab_summary:
 
                 sku_meta = skus[["drug_id", "drug_name", "drug_type", "old_price", "new_price"]]
                 display = funnel.merge(sku_meta, on="drug_id", how="left")
+                display["group_id"] = display["drug_id"].map(lambda d: group_lookup.get(int(d)))
                 display["switched_subs_%"] = (display["n_switched_subs"] / display["n_pre_buyers"] * 100).round(1)
                 display["lapsed_%"] = (display["n_lapsed"] / display["n_pre_buyers"] * 100).round(1)
                 display = display[[
-                    "drug_id", "drug_name", "drug_type", "old_price", "new_price",
+                    "drug_id", "drug_name", "drug_type", "group_id", "old_price", "new_price",
                     "n_pre_buyers", "n_stayed", "n_switched_subs", "n_switched_other_pi", "n_lapsed",
                     "switched_subs_%", "lapsed_%",
                 ]].sort_values("n_switched_subs", ascending=False)
 
+                st.markdown("**Per price-↑ SKU**")
                 st.dataframe(
                     display, width="stretch", hide_index=True,
                     column_config={
                         "drug_id": st.column_config.NumberColumn("Drug ID", format="%d"),
                         "drug_name": st.column_config.Column("Drug", pinned=True),
                         "drug_type": "Type",
+                        "group_id": st.column_config.NumberColumn("Group ID", format="%d",
+                            help="Same-composition group from drug-substitution-mapping."),
                         "old_price": st.column_config.NumberColumn("Old ₹", format="%.2f"),
                         "new_price": st.column_config.NumberColumn("New ₹", format="%.2f"),
                         "n_pre_buyers": st.column_config.NumberColumn("Pre-buyers", format="%d"),
@@ -531,12 +535,74 @@ with tab_summary:
                     },
                 )
                 st.download_button(
-                    "📥 Download substitution funnel",
+                    "📥 Download per-SKU funnel",
                     data=display.to_csv(index=False).encode("utf-8"),
-                    file_name="substitution_funnel.csv",
+                    file_name="substitution_funnel_by_sku.csv",
                     mime="text/csv",
                     key="dl_subs_funnel",
                 )
+
+                # ----- Per composition group rollup ---------------------------
+                by_group_src = display.copy()
+                by_group_src = by_group_src[by_group_src["group_id"].notna()]
+                if by_group_src.empty:
+                    st.info("No group_id mappings available for any price-↑ SKU in the funnel.")
+                else:
+                    grp_sums = by_group_src.groupby("group_id", as_index=False).agg(
+                        n_skus_in_group_hiked=("drug_id", "nunique"),
+                        n_pre_buyers=("n_pre_buyers", "sum"),
+                        n_stayed=("n_stayed", "sum"),
+                        n_switched_subs=("n_switched_subs", "sum"),
+                        n_switched_other_pi=("n_switched_other_pi", "sum"),
+                        n_lapsed=("n_lapsed", "sum"),
+                    )
+                    # Representative drug per group: the price-↑ SKU with most pre-buyers.
+                    rep_idx = by_group_src.groupby("group_id")["n_pre_buyers"].idxmax()
+                    rep = by_group_src.loc[rep_idx, ["group_id", "drug_name", "drug_type"]].rename(
+                        columns={"drug_name": "rep_drug_name", "drug_type": "rep_drug_type"}
+                    )
+                    grp_disp = grp_sums.merge(rep, on="group_id", how="left")
+                    grp_disp["switched_subs_%"] = (grp_disp["n_switched_subs"] / grp_disp["n_pre_buyers"] * 100).round(1)
+                    grp_disp["lapsed_%"] = (grp_disp["n_lapsed"] / grp_disp["n_pre_buyers"] * 100).round(1)
+                    grp_disp["group_id"] = grp_disp["group_id"].astype(int)
+                    grp_disp = grp_disp[[
+                        "group_id", "rep_drug_name", "rep_drug_type", "n_skus_in_group_hiked",
+                        "n_pre_buyers", "n_stayed", "n_switched_subs", "n_switched_other_pi", "n_lapsed",
+                        "switched_subs_%", "lapsed_%",
+                    ]].sort_values("n_pre_buyers", ascending=False)
+
+                    st.markdown("**Per composition group** (rollup of the per-SKU table by `group_id`)")
+                    st.caption(
+                        "One row per distinct composition group containing ≥1 price-↑ SKU. "
+                        "Counts are sums of the per-SKU table — a patient who pre-bought two different "
+                        "price-↑ SKUs in the same group is counted twice. Most chronic patients stick to "
+                        "one brand though, so this is a small effect in practice."
+                    )
+                    st.dataframe(
+                        grp_disp, width="stretch", hide_index=True,
+                        column_config={
+                            "group_id": st.column_config.NumberColumn("Group ID", format="%d"),
+                            "rep_drug_name": st.column_config.Column("Representative drug", pinned=True,
+                                help="The price-↑ SKU in this group with the most pre-buyers."),
+                            "rep_drug_type": "Type",
+                            "n_skus_in_group_hiked": st.column_config.NumberColumn("PI SKUs in group", format="%d",
+                                help="How many of the 346 price-↑ SKUs fall in this composition group."),
+                            "n_pre_buyers": st.column_config.NumberColumn("Pre-buyers", format="%d"),
+                            "n_stayed": st.column_config.NumberColumn("Stayed", format="%d"),
+                            "n_switched_subs": st.column_config.NumberColumn("→ Substitute", format="%d"),
+                            "n_switched_other_pi": st.column_config.NumberColumn("→ Other PI", format="%d"),
+                            "n_lapsed": st.column_config.NumberColumn("Lapsed", format="%d"),
+                            "switched_subs_%": st.column_config.NumberColumn("Sub %", format="%.1f"),
+                            "lapsed_%": st.column_config.NumberColumn("Lapsed %", format="%.1f"),
+                        },
+                    )
+                    st.download_button(
+                        "📥 Download per-group rollup",
+                        data=grp_disp.to_csv(index=False).encode("utf-8"),
+                        file_name="substitution_funnel_by_group.csv",
+                        mime="text/csv",
+                        key="dl_subs_funnel_grp",
+                    )
 
     # Inline Cohort SKU pre/post — same as the dedicated 🎯 tab, contextual to Summary's cohort
     with st.expander("📋 Cohort SKU pre/post — for the patients shown above", expanded=False):
