@@ -79,10 +79,10 @@ STORE_PAIRS = [
 ]
 PILOT_STORES = tuple(p["pilot"] for p in STORE_PAIRS)
 PAIRED_NON_PILOT_STORES = tuple(p["non_pilot"] for p in STORE_PAIRS)
-QUANT_PRE_START = pd.Timestamp("2026-04-13").date()
+QUANT_PRE_START = pd.Timestamp("2026-04-10").date()
 QUANT_PRE_END = pd.Timestamp("2026-05-05").date()
 QUANT_POST_START = pd.Timestamp("2026-05-06").date()
-QUANT_POST_END = pd.Timestamp("2026-05-28").date()
+QUANT_POST_END = pd.Timestamp("2026-05-31").date()
 QUANT_BASELINE_START = pd.Timestamp("2026-01-01").date()
 QUANT_BASELINE_END = pd.Timestamp("2026-04-19").date()
 ASSORTMENT_GENERIC = (3, 4)   # Generic + Generic-Speciality
@@ -199,6 +199,11 @@ def _normalize_alpha_serial(raw: str) -> str | None:
     if s[:1] in ("Z", "z"):
         s = s[1:]
     s = s.strip().upper().replace(" ", "")
+    # Auto-insert hyphen for STORE-prefix typed without separator (e.g. `KHAN312395` → `KHAN-312395`).
+    if "-" not in s:
+        import re as _re
+        m = _re.match(r"^([A-Z]+)(\d+)$", s)
+        if m: s = f"{m.group(1)}-{m.group(2)}"
     if not SERIAL_RE.match(s):
         return None
     prefix, _, rest = s.partition("-")
