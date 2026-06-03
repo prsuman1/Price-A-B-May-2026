@@ -17,3 +17,9 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# Deep-analysis workspace (LT readout — outputs not version-controlled)
+deep-analysis/
+
+# Local scratch / one-off scripts — not version-controlled
+rough_tasks/
